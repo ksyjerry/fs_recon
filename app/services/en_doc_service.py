@@ -331,7 +331,9 @@ def _word_bold_sections(
             if (is_list_top or is_bold_hdr) and text not in seen_titles:
                 flush()
                 note_counter += 1
-                current_num = str(note_counter)
+                # "B1", "B2" 형태로 부여 → 국문 순번(1, 2, 3...)과 겹치지 않아
+                # mapping_service에서 번호 매핑을 건너뛰고 LLM 제목 매핑으로 처리됨
+                current_num = f"B{note_counter}"
                 current_title = text
                 current_lines = [text]
                 seen_titles.add(text)
