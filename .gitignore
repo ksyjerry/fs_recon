@@ -3,6 +3,7 @@
 
 # 임시 파일
 temp/
+files/
 *.dsd
 *.xlsx
 
