@@ -7,6 +7,7 @@ mapping_service.py — 국문 DSDNote ↔ 영문 EnNote 주석 단위 매핑.
 """
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from app.models.dsd_model import DSDNote
@@ -178,6 +179,9 @@ async def _llm_map(
 
         en_num = _norm(en_num_raw) if en_num_raw else None
         en_note = en_by_num_llm.get(en_num) if en_num else None
+        # LLM이 "B4" 대신 "4"처럼 prefix를 벗겨서 반환한 경우 fallback
+        if en_note is None and en_num and re.match(r"^\d+$", en_num):
+            en_note = en_by_num_llm.get(f"B{en_num}")
         logger.debug("LLM 매핑: kr=%r → en=%r (conf=%.2f, en_note=%s)",
                      kr_note.note_number, en_num_raw, conf,
                      en_note.note_title if en_note else "None")
