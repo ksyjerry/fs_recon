@@ -308,7 +308,12 @@ def _write_mismatches(wb: Workbook, results: list[ReconcileResult]):
 # ─── Note_XX 시트 ────────────────────────────────────────────────
 
 def _write_note_sheet(wb: Workbook, result: ReconcileResult):
-    sheet_name = f"Note_{int(result.note_number_kr):02d}"
+    try:
+        sheet_name = f"Note_{int(result.note_number_kr):02d}"
+    except (ValueError, TypeError):
+        sheet_name = f"Note_{result.note_number_kr}"
+    # Excel 시트명 31자 제한 및 금지문자 처리
+    sheet_name = sheet_name[:31].replace("/", "_").replace("\\", "_").replace("?", "X")
     ws = wb.create_sheet(sheet_name)
     ws.sheet_view.showGridLines = False
 

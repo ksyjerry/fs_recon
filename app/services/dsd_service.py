@@ -344,14 +344,20 @@ async def _llm_parse_note(
             logger.error("주석 %s 금액 추출 실패: %s", note_number, e)
             return None
 
-    return _build_dsd_note(result)
+    return _build_dsd_note(result, fallback_number=note_number, fallback_title=note_title)
 
 
-def _build_dsd_note(data: dict) -> DSDNote | None:
-    """LLM JSON 응답 → DSDNote."""
+def _build_dsd_note(
+    data: dict,
+    fallback_number: str = "?",
+    fallback_title: str = "",
+) -> DSDNote | None:
+    """LLM JSON 응답 → DSDNote.
+    LLM이 note_number를 누락한 경우 경계 감지 단계의 fallback_number 사용.
+    """
     try:
-        note_number = str(data.get("note_number", "?"))
-        note_title  = str(data.get("note_title",  ""))
+        note_number = str(data.get("note_number") or fallback_number)
+        note_title  = str(data.get("note_title")  or fallback_title)
         unit        = str(data.get("unit",         "원"))
 
         items: list[DSDItem] = []
