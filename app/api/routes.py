@@ -139,9 +139,11 @@ async def _run_reconciliation(
 
     try:
         append_log(job_id, "처리 파이프라인 시작")
+        llm_client = get_llm_client(provider)
+
         # Step 1: DSD 파싱 (5%)
         progress(5, "DSD 파일 변환 중...")
-        kr_notes = await parse_dsd_file(dsd_path)
+        kr_notes = await parse_dsd_file(dsd_path, llm_client)
         msg1 = f"DSD 파싱 완료: 주석 {len(kr_notes)}개 감지"
         logger.info("[%s] %s", job_id, msg1)
         append_log(job_id, msg1)
@@ -155,7 +157,6 @@ async def _run_reconciliation(
 
         # Step 3: 주석 매핑 (20%)
         progress(20, "주석 매핑 중...")
-        llm_client = get_llm_client(provider)
         mappings = await map_notes(kr_notes, en_doc, llm_client)
         msg3 = f"주석 매핑 완료: 국문↔영문 {len(mappings)}쌍"
         logger.info("[%s] %s", job_id, msg3)

@@ -101,9 +101,18 @@ async def _reconcile_one(
             items=items,
         )
 
-    # 금액 없는 주석 (텍스트 전용) → 항목만 기록
-    non_header_items = [i for i in kr_note.items if not i.is_header_only]
-    if not non_header_items:
+    # 대사 가능 payload 빌드 (금액이 있는 항목만)
+    dsd_payload = _build_dsd_items_payload(kr_note.items)
+
+    if not dsd_payload:
+        # 금액 항목 없음: DSD 파싱 실패 또는 순수 텍스트 주석
+        # → 항목 목록은 유지하되 LLM 금액 대사 건너뜀
+        # → Excel에서 "금액 없음" 으로 표시되며 주석 매핑 결과는 보존
+        logger.warning(
+            "주석 %s [%s]: 대사 가능한 금액 없음 "
+            "(DSD 파싱 누락 또는 텍스트 전용 주석)",
+            kr_note.note_number, kr_note.note_title,
+        )
         return ReconcileResult(
             note_number_kr=kr_note.note_number,
             note_number_en=en_note.note_number,
@@ -113,8 +122,8 @@ async def _reconcile_one(
             items=[_make_header_only_item(item) for item in kr_note.items],
         )
 
-    # LLM 대사 실행
-    llm_responses = await _call_llm_reconcile(kr_note, en_note, llm_client)
+    # LLM 대사 실행 (이미 빌드된 payload 전달로 중복 빌드 방지)
+    llm_responses = await _call_llm_reconcile(kr_note, en_note, llm_client, dsd_payload)
 
     # LLM 응답 → ReconcileItem 변환
     items = _build_reconcile_items(kr_note.items, llm_responses)
@@ -137,13 +146,15 @@ async def _call_llm_reconcile(
     kr_note: DSDNote,
     en_note: EnNote,
     llm_client: BaseLLMClient,
+    dsd_items_payload: list[dict] | None = None,
 ) -> list[dict]:
     """
     주석 1쌍에 대해 LLM 대사 호출.
     영문 원문이 길어도 최신 모델은 128k+ 컨텍스트 지원으로 기본 단일 호출.
     실패 시 청크 분할 fallback.
     """
-    dsd_items_payload = _build_dsd_items_payload(kr_note.items)
+    if dsd_items_payload is None:
+        dsd_items_payload = _build_dsd_items_payload(kr_note.items)
 
     try:
         return await _llm_single_call(kr_note, en_note, dsd_items_payload, llm_client)
@@ -215,8 +226,9 @@ def _build_system_prompt() -> str:
         "3. 영문에서 합계/소계 레이블이 없어도 숫자의 위치와 맥락으로 판단하세요.\n"
         "4. 다차원 속성(기간/만기/수준/잔액 등)을 고려해 어떤 열·행의 금액인지 파악하세요.\n"
         "5. 찾지 못하면 found=false로 명시하세요 (억지로 찾지 마세요).\n"
-        "6. 국문 금액은 이미 원(KRW) 단위로 정규화되어 있으나, 영문은 천원(thousands) 단위일 수 있습니다.\n"
+        "6. 국문 금액은 이미 원(KRW) 단위로 정규화되어 있으나, 영문은 천원(thousands) 또는 백만원(million) 단위일 수 있습니다.\n"
         "   → value_en은 영문 원문에 표기된 숫자 그대로 반환하세요 (단위 변환 금지).\n"
+        "   예: '₩246 million' → value_en=246, '₩1,366,255 thousand' → value_en=1366255\n"
         "7. reasoning 필드는 반드시 한국어로 작성하세요.\n"
         "   - found=true이고 금액이 일치할 것으로 보이면 reasoning을 빈 문자열(\"\")로 반환하세요.\n"
         "   - found=false(미발견)이거나 금액 불일치가 의심될 때만 구체적인 이유를 한국어로 작성하세요.\n"
@@ -387,12 +399,14 @@ def _calc_match(
 ) -> tuple[bool | None, float | None, float | None]:
     """
     수치 일치 판정 + 영문 금액 단위 정규화.
-    영문은 천원(thousands) 단위일 수 있으므로 ×1000 비교도 수행.
+    영문은 천원(thousands) 또는 백만원(million) 단위일 수 있으므로 다단계 비교.
 
     반환: (is_match, variance, normalized_value_en)
       - normalized_value_en: 원 단위로 정규화된 영문 금액
-        * 직접 일치 또는 단위 무관 → value_en 그대로
-        * ×1000 일치 또는 ×1000 관계 감지 → value_en × 1000
+        * 직접 일치     → value_en 그대로
+        * ×1,000 일치   → value_en × 1,000   (영문 천원 단위)
+        * ×1,000,000 일치 → value_en × 1,000,000 (영문 백만원/million 단위)
+        * 불일치        → 비율 추론으로 가장 적합한 스케일 적용
     """
     if value_kr is None or value_en is None:
         return None, None, value_en
@@ -400,22 +414,26 @@ def _calc_match(
     tol = max(MATCH_TOLERANCE_ABS, abs(value_kr) * MATCH_TOLERANCE_RATIO)
 
     # 1) 직접 비교 (같은 단위)
-    diff = abs(value_kr - value_en)
-    if diff <= tol:
+    if abs(value_kr - value_en) <= tol:
         return True, value_en - value_kr, value_en
 
-    # 2) ×1000 비교 (영문이 천원 단위)
-    value_en_scaled = value_en * 1000
-    diff_scaled = abs(value_kr - value_en_scaled)
-    if diff_scaled <= tol:
-        return True, value_en_scaled - value_kr, value_en_scaled
+    # 2) ×1,000 비교 (영문이 천원/thousands 단위)
+    value_en_k = value_en * 1_000
+    if abs(value_kr - value_en_k) <= tol:
+        return True, value_en_k - value_kr, value_en_k
 
-    # 3) 불일치 — 단위 추론하여 표시값 결정
-    # 비율이 500~2000배면 ×1000 관계로 간주, 스케일된 값으로 variance 계산
+    # 3) ×1,000,000 비교 (영문이 백만원/million 단위 — "\ 246 million" 등)
+    value_en_m = value_en * 1_000_000
+    if abs(value_kr - value_en_m) <= tol:
+        return True, value_en_m - value_kr, value_en_m
+
+    # 4) 불일치 — 비율로 단위 추론하여 표시값 결정
     if value_en != 0 and abs(value_kr) > 0:
         ratio = abs(value_kr / value_en)
-        if 500 <= ratio <= 2000:
-            return False, value_en_scaled - value_kr, value_en_scaled
+        if 500 <= ratio <= 2_000:
+            return False, value_en_k - value_kr, value_en_k
+        if 500_000 <= ratio <= 2_000_000:
+            return False, value_en_m - value_kr, value_en_m
 
     return False, value_en - value_kr, value_en
 

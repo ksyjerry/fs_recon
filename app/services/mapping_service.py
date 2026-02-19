@@ -16,6 +16,21 @@ from app.utils.llm_client import BaseLLMClient
 logger = logging.getLogger(__name__)
 
 
+def _norm(s: str) -> str:
+    """
+    주석 번호 정규화: 공백 제거 + 소수점 정수 변환.
+    예: " 15 " → "15", "15.0" → "15", "15.00" → "15"
+    """
+    s = s.strip()
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except (ValueError, TypeError):
+        pass
+    return s
+
+
 @dataclass
 class NoteMapping:
     kr_note: DSDNote
@@ -43,7 +58,13 @@ async def map_notes(
             for kr in kr_notes
         ]
 
-    en_by_num: dict[str, EnNote] = {n.note_number: n for n in en_doc.notes}
+    # 영문 주석 번호 정규화 → 딕셔너리 (중복 시 마지막 우선)
+    en_by_num: dict[str, EnNote] = {_norm(n.note_number): n for n in en_doc.notes}
+
+    logger.info("국문 주석 번호 목록: %s",
+                [(kr.note_number, kr.note_title) for kr in kr_notes])
+    logger.info("영문 주석 번호 목록: %s",
+                sorted(en_by_num.keys(), key=lambda x: int(x) if x.isdigit() else 999))
 
     mappings: list[NoteMapping] = []
     unmatched_kr: list[DSDNote] = []
@@ -51,15 +72,18 @@ async def map_notes(
 
     # ── 1단계: 번호 기반 매핑 ──────────────────────────────
     for kr in kr_notes:
-        if kr.note_number in en_by_num:
+        kr_num = _norm(kr.note_number)
+        if kr_num in en_by_num:
             mappings.append(NoteMapping(
                 kr_note=kr,
-                en_note=en_by_num[kr.note_number],
+                en_note=en_by_num[kr_num],
                 confidence=1.0,
                 method="number",
             ))
-            unmatched_en_nums.discard(kr.note_number)
+            unmatched_en_nums.discard(kr_num)
         else:
+            logger.debug("번호 매핑 실패: kr=%r (정규화=%r) | en 키=%r",
+                         kr.note_number, kr_num, sorted(en_by_num.keys()))
             unmatched_kr.append(kr)
 
     logger.info(
@@ -125,41 +149,51 @@ async def _llm_map(
     )
 
     try:
-        result = llm_client.chat_json([
+        result = await llm_client.chat_json_async([
             {"role": "system", "content": system_msg},
             {"role": "user",   "content": user_msg},
         ])
-        raw_mappings: list[dict] = result.get("mappings", [])
-    except (ValueError, KeyError) as e:
+        raw_mappings: list[dict] = result.get("mappings") or []
+    except Exception as e:
         logger.error("LLM 주석 매핑 실패: %s", e)
         raw_mappings = []
 
-    # LLM 결과 → NoteMapping 변환
-    en_by_num = {en.note_number: en for en in unmatched_en}
-    mapped_kr_nums: set[str] = set()
+    # LLM 결과 → NoteMapping 변환 (번호 정규화 후 비교)
+    en_by_num_llm = {_norm(en.note_number): en for en in unmatched_en}
+    mapped_kr_norms: set[str] = set()
     llm_results: list[NoteMapping] = []
 
     for item in raw_mappings:
-        kr_num = str(item.get("kr_num", ""))
-        en_num = str(item.get("en_num", "")) if item.get("en_num") else None
-        conf   = float(item.get("confidence", 0.5))
+        kr_num_raw = str(item.get("kr_num", ""))
+        en_num_raw = str(item.get("en_num", "")) if item.get("en_num") else None
+        conf       = float(item.get("confidence", 0.5))
 
-        kr_note = next((k for k in unmatched_kr if k.note_number == kr_num), None)
+        kr_num = _norm(kr_num_raw)
+        kr_note = next(
+            (k for k in unmatched_kr if _norm(k.note_number) == kr_num), None
+        )
         if kr_note is None:
+            logger.warning("LLM 매핑 결과에서 kr_num=%r를 unmatched_kr에서 찾지 못함", kr_num_raw)
             continue
 
-        en_note = en_by_num.get(en_num) if en_num else None
+        en_num = _norm(en_num_raw) if en_num_raw else None
+        en_note = en_by_num_llm.get(en_num) if en_num else None
+        logger.debug("LLM 매핑: kr=%r → en=%r (conf=%.2f, en_note=%s)",
+                     kr_note.note_number, en_num_raw, conf,
+                     en_note.note_title if en_note else "None")
         llm_results.append(NoteMapping(
             kr_note=kr_note,
             en_note=en_note,
             confidence=conf,
             method="llm",
         ))
-        mapped_kr_nums.add(kr_num)
+        mapped_kr_norms.add(kr_num)
 
     # LLM이 매핑하지 못한 나머지 → unmatched
     for kr in unmatched_kr:
-        if kr.note_number not in mapped_kr_nums:
+        if _norm(kr.note_number) not in mapped_kr_norms:
+            logger.warning("매핑 실패 (unmatched): 국문 주석 %s [%s]",
+                           kr.note_number, kr.note_title)
             llm_results.append(NoteMapping(
                 kr_note=kr, en_note=None, confidence=0.0, method="unmatched",
             ))

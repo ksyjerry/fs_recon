@@ -1,319 +1,452 @@
 """
-DSD 파일을 파싱하여 DSDNote 목록으로 변환하는 서비스.
-parsers/dsd_to_json.py 원본 수정 없이 래핑만 수행.
+DSD 파일을 LLM으로 파싱하여 DSDNote 목록으로 변환하는 서비스.
+
+기존 dsd_to_json.py + regex 방식의 한계 (주석 누락)를 극복하기 위해
+DSD ZIP에서 XML을 직접 추출 후 LLM이 주석 경계 감지 및 금액 추출.
 """
+import asyncio
 import json
 import logging
 import re
-import sys
-import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from app.models.dsd_model import DSDAmount, DSDItem, DSDNote
-from app.utils.amount_utils import (
-    detect_unit_from_text,
-    flatten_dict,
-    normalize_unit,
-    parse_amount,
-)
-
-# parsers 패키지를 찾기 위해 프로젝트 루트를 sys.path에 추가
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-from parsers.dsd_to_json import process_dsd_to_json  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# 행 레이블로 처리할 컬럼 키 목록 (이 키에 해당하는 컬럼은 label로 사용)
-LABEL_COLUMNS = {"계정과목", "항목", "구분", "내용", "과목", "종류", ""}
+# ── LLM 프롬프트 ────────────────────────────────────────────────────
 
-# 주석 제목 감지 패턴들
-# 형식 1: "주석 15. 제목"
-NOTE_PATTERN_EXPLICIT = re.compile(
-    r"^\s*주석\s*(\d+)[.\s]*(.*)$",
-)
-# 형식 2: "15. 제목" — "15.1 소제목" 같은 하위 항목 제외
-# → 소수점 없는 순수 정수 + ". " + 텍스트
-NOTE_PATTERN_SIMPLE = re.compile(
-    r"^\s*(\d+)\.\s+(.+)$",
-)
+_BOUNDARY_SYSTEM = "당신은 한국 재무제표 DSD 파일 분석 전문가입니다."
+
+_BOUNDARY_USER = """\
+아래는 DSD 재무제표 파일에서 추출한 단락 목록입니다 (인덱스: 텍스트 형식).
+
+이 목록에서 각 "주석(Note)" 섹션의 시작 위치를 찾아주세요.
+
+주석 헤더 형식 예시:
+ - "주석 1. 일반사항"
+ - "1. 현금및현금성자산"
+ - "주석15. 법인세"
+ - "16 종업원급여"
+
+재무상태표·손익계산서 등 재무제표 본문의 계정 행은 주석 헤더가 아닙니다.
+오직 새로운 주석 섹션을 여는 상위 제목만 포함하세요.
+
+반드시 JSON 배열만 반환 (다른 텍스트 금지):
+[
+  {{"segment_index": 42, "note_number": "1", "note_title": "일반사항"}},
+  {{"segment_index": 67, "note_number": "2", "note_title": "재무제표 작성기준"}},
+  ...
+]
+
+단락 목록:
+{para_list}
+"""
+
+_EXTRACT_SYSTEM = """\
+당신은 한국 재무제표 주석(Notes to Financial Statements) 데이터 추출 전문가입니다.
+회계 테이블의 다차원 헤더(당기/전기, 레벨1/2/3, 만기구간 등)를 정확히 파악하세요.
+"""
+
+_EXTRACT_USER = """\
+아래는 재무제표 주석 {note_number}. {note_title}의 전체 내용입니다.
+
+[DSD 특수 형식 안내 — 반드시 숙지]
+DSD 파일에서 테이블은 각 셀이 별도 줄로 나타납니다. 예시:
+  구분          ← 헤더 레이블
+  2025년        ← 헤더 컬럼1
+  2024년        ← 헤더 컬럼2
+  1년 이하      ← 행 레이블
+  1,366,255     ← 행1 컬럼1 금액 (2025년)
+  707,200       ← 행1 컬럼2 금액 (2024년)
+  5년 초과      ← 행 레이블 (다음에 금액 줄이 없으면 value=null)
+  합계          ← 행 레이블
+  6,274,247     ← 합계 컬럼1 금액
+  925,199       ← 합계 컬럼2 금액
+
+규칙:
+- 헤더(레이블 컬럼명 행) 다음에 오는 숫자들은 해당 헤더 컬럼 순서로 대응
+- 레이블 바로 다음에 다른 레이블이 오면(숫자 없음) → amounts=[] 또는 value=null
+- "&cr;" 은 줄바꿈 마커(무시)
+- 단락 텍스트 안에 포함된 금액도 별도 항목으로 추출 (예: "리스료는 1,059,251천원...")
+- "NNN천원(전기: MMM천원)" 형태에서 당기와 전기를 각각 별도 amounts로 추출:
+  amounts: [
+    {{"attributes": {{"기간": "당기"}}, "value": NNN*1000, "raw_text": "NNN천원"}},
+    {{"attributes": {{"기간": "전기"}}, "value": MMM*1000, "raw_text": "MMM천원"}}
+  ]
+
+[추출 규칙]
+1. 모든 행(합계·소계·제목행 포함)을 추출하세요.
+2. 금액이 없는 순수 제목행은 is_header_only=true, amounts=[]
+3. 단위 감지: "(단위: 천원)" 등에서 unit 파악
+4. 금액을 원 단위로 정규화 (단위 "천원" → 값×1000, "백만원" → 값×1000000)
+5. 다차원 헤더를 attributes 딕셔너리로 표현
+   예) 당기/전기 × 수준1/수준2 → {{"기간":"당기","수준":"수준1"}}
+   컬럼 헤더가 연도(2025년/2024년)이면 {{"연도":"2025"}} 형식 사용
+6. "-" 또는 빈 셀은 value=null
+7. 괄호 금액은 음수: "(1,234,567)" → -1234567000 (천원 단위 가정)
+8. reasoning 없이 JSON만 반환 (마크다운·설명 금지)
+
+반환 형식:
+{{
+  "note_number": "{note_number}",
+  "note_title": "{note_title}",
+  "unit": "천원",
+  "items": [
+    {{
+      "item_id": 0,
+      "label": "행 레이블",
+      "is_header_only": false,
+      "amounts": [
+        {{
+          "attributes": {{"기간": "당기"}},
+          "value": 1234567000,
+          "raw_text": "1,234,567"
+        }}
+      ]
+    }}
+  ]
+}}
+
+주석 내용:
+{note_content}
+"""
+
+# ── 1. DSD XML 추출 ──────────────────────────────────────────────────
+
+def _read_contents_xml(dsd_path: Path) -> str:
+    """DSD ZIP에서 contents.xml 원문 반환."""
+    with zipfile.ZipFile(dsd_path, "r") as zf:
+        for name in zf.namelist():
+            if "contents" in name.lower() and name.lower().endswith(".xml"):
+                data = zf.read(name)
+                for enc in ("utf-8", "euc-kr", "cp949", "utf-8-sig"):
+                    try:
+                        return data.decode(enc)
+                    except UnicodeDecodeError:
+                        continue
+                return data.decode("utf-8", errors="replace")
+    raise ValueError(f"DSD에서 contents.xml을 찾을 수 없음: {dsd_path.name}")
 
 
-async def parse_dsd_file(dsd_path: Path) -> list[DSDNote]:
-    """
-    DSD 파일을 읽어 DSDNote 목록을 반환.
+# ── 2. XML → 텍스트 세그먼트 ────────────────────────────────────────
 
-    1. dsd_to_json.py의 process_dsd_to_json() 호출 → JSON 생성
-    2. JSON 로드 후 주석 섹션 분리
-    3. 각 주석 내 테이블 행을 DSDItem으로 변환
-    """
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        output_json_path = tmp.name
+# 단락으로 처리할 태그 이름 (upper-case)
+_PARA_TAGS = {"P", "PARA", "PARAGRAPH", "TEXT", "TITLE", "SUBTITLE", "LI", "ITEM", "NOTE"}
+# 건너뛸 메타데이터 태그
+_SKIP_TAGS = {"DOCUMENT-HEADER", "DOCUMENT-INFO", "GENERATOR", "EXTRACTION",
+              "SCHEMA", "HEADER", "METADATA"}
 
+
+def _traverse(elem: ET.Element, segments: list[dict]):
+    tag = (elem.tag or "").upper().split("}")[-1]  # 네임스페이스 제거
+
+    # 메타데이터 건너뜀
+    if any(s in tag for s in _SKIP_TAGS):
+        return
+
+    # 테이블 처리
+    if "TABLE" in tag or tag in ("TBL", "TABL"):
+        rows = _get_table_rows(elem)
+        if rows:
+            segments.append({"type": "table", "rows": rows, "text": _rows_to_text(rows)})
+        return  # 테이블 내부 재귀 금지
+
+    # 단락 처리: 단락 태그이거나 자식이 없는 리프 노드
+    is_para_tag = tag in _PARA_TAGS
+    is_leaf = len(list(elem)) == 0
+
+    if is_para_tag or is_leaf:
+        text = " ".join(elem.itertext()).strip()
+        text = re.sub(r"\s+", " ", text)
+        # "&cr;"만으로 구성된 세그먼트 제외, 단일문자 "-"(null 금액) 허용
+        if text and text not in ("&cr;",) and (len(text) > 1 or text == "-"):
+            segments.append({"type": "p", "text": text})
+        # 단락 태그면 내부 재귀 금지
+        if is_para_tag:
+            return
+
+    # 요소 자체의 직접 텍스트 (tail 포함)
+    if elem.text and elem.text.strip():
+        t = re.sub(r"\s+", " ", elem.text.strip())
+        if t and t not in ("&cr;",) and (len(t) > 1 or t == "-"):
+            segments.append({"type": "p", "text": t})
+
+    # 자식 재귀
+    for child in elem:
+        _traverse(child, segments)
+        if child.tail and child.tail.strip():
+            tail = re.sub(r"\s+", " ", child.tail.strip())
+            if tail and len(tail) > 1:
+                segments.append({"type": "p", "text": tail})
+
+
+def _get_table_rows(table_elem: ET.Element) -> list[list[str]]:
+    rows: list[list[str]] = []
+    row_tags = {"ROW", "TR", "R"}
+
+    # 직접 자식 중 ROW 계열 찾기
+    for elem in table_elem.iter():
+        tag = (elem.tag or "").upper().split("}")[-1]
+        if tag in row_tags:
+            cells = []
+            for cell in elem:
+                cell_text = " ".join(cell.itertext()).strip()
+                cells.append(re.sub(r"\s+", " ", cell_text))
+            if any(cells):
+                rows.append(cells)
+
+    # ROW 구조가 없으면 전체 텍스트를 1행으로
+    if not rows:
+        text = " ".join(table_elem.itertext()).strip()
+        if text:
+            rows.append([text])
+
+    return rows
+
+
+def _rows_to_text(rows: list[list[str]]) -> str:
+    return "\n".join("\t".join(cells) for cells in rows)
+
+
+def _extract_segments(dsd_path: Path) -> list[dict]:
+    xml_str = _read_contents_xml(dsd_path)
     try:
-        process_dsd_to_json(str(dsd_path), output_json_path)
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        # 불완전한 XML일 경우 repair 시도
+        xml_str = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", xml_str)
+        root = ET.fromstring(xml_str)
 
-        with open(output_json_path, encoding="utf-8") as f:
-            raw_data: list[dict] = json.load(f)
-    finally:
-        Path(output_json_path).unlink(missing_ok=True)
+    segments: list[dict] = []
+    _traverse(root, segments)
 
-    # 모든 파일의 content를 순서대로 합침
-    all_content: list[dict] = []
-    source_map: dict[int, str] = {}  # content index → filename
-    for file_entry in raw_data:
-        filename = file_entry.get("filename", "unknown")
-        for item in file_entry.get("content", []):
-            source_map[len(all_content)] = filename
-            all_content.append(item)
+    # 중복 단락 제거 (연속 중복)
+    deduped: list[dict] = []
+    for seg in segments:
+        if not deduped or seg != deduped[-1]:
+            deduped.append(seg)
 
-    notes = _split_into_notes(all_content, source_map)
-    logger.info("DSD 파싱 완료: 주석 %d개", len(notes))
-    return notes
+    logger.debug("XML 세그먼트 추출: %d개", len(deduped))
+    return deduped
 
 
-def _detect_note_header(text: str) -> tuple[str, str] | None:
+# ── 3. LLM 주석 경계 감지 ────────────────────────────────────────────
+
+async def _llm_find_boundaries(segments: list[dict], llm_client) -> list[dict]:
     """
-    텍스트가 주석 최상위 섹션 제목이면 (번호, 제목) 반환, 아니면 None.
-    하위 항목(1.1, 2.1 등) 및 &cr; 노이즈는 제외.
+    단락 목록을 LLM에 보내 주석 시작 위치 반환.
+    [{"segment_index": int, "note_number": str, "note_title": str}, ...]
     """
-    text = text.strip()
-    if not text or "&cr;" in text:
+    # 단락만 추출 (테이블 제외) — LLM에 줄 목록
+    para_lines: list[str] = []
+    for i, seg in enumerate(segments):
+        if seg["type"] == "p":
+            # &cr; 제거 후 첫 번째 줄(= 제목부)만 표시 (긴 단락은 제목만 보임)
+            text = seg["text"].replace("&cr;", " ").strip()
+            text = text.split("\n")[0][:120]
+            para_lines.append(f"{i}: {text}")
+
+    if not para_lines:
+        return []
+
+    # 너무 많으면 뒤쪽 1000줄만 (주석은 보통 후반부)
+    if len(para_lines) > 1000:
+        para_lines = para_lines[-1000:]
+
+    para_text = "\n".join(para_lines)
+
+    messages = [
+        {"role": "system", "content": _BOUNDARY_SYSTEM},
+        {"role": "user",   "content": _BOUNDARY_USER.format(para_list=para_text)},
+    ]
+    try:
+        result = await asyncio.to_thread(llm_client.chat_json, messages)
+        if isinstance(result, list) and result:
+            # segment_index 유효성 검사
+            valid = [
+                b for b in result
+                if isinstance(b.get("segment_index"), int)
+                and 0 <= b["segment_index"] < len(segments)
+            ]
+            if valid:
+                logger.info("LLM 주석 경계 감지: %d개", len(valid))
+                return sorted(valid, key=lambda x: x["segment_index"])
+    except Exception as e:
+        logger.warning("LLM 주석 경계 감지 실패: %s — regex fallback 사용", e)
+
+    return _regex_find_boundaries(segments)
+
+
+def _regex_find_boundaries(segments: list[dict]) -> list[dict]:
+    """LLM 실패 시 regex fallback."""
+    PAT_EXPLICIT = re.compile(r"^\s*주\s*석\s*(\d+)\s*[.\s]*(.*)\s*$")
+    PAT_SIMPLE   = re.compile(r"^\s*(\d+)\s*[.\s]\s*([가-힣\w\s]{2,40})\s*$")
+
+    results: list[dict] = []
+    for i, seg in enumerate(segments):
+        if seg["type"] != "p":
+            continue
+        text = seg["text"]
+        for pat in [PAT_EXPLICIT, PAT_SIMPLE]:
+            m = pat.match(text)
+            if m:
+                results.append({
+                    "segment_index": i,
+                    "note_number": m.group(1).strip(),
+                    "note_title": m.group(2).strip(),
+                })
+                break
+    logger.info("Regex 주석 경계 감지: %d개", len(results))
+    return results
+
+
+# ── 4. LLM 주석 금액 추출 ─────────────────────────────────────────────
+
+def _build_note_text(note_segments: list[dict]) -> str:
+    lines: list[str] = []
+    for seg in note_segments:
+        if seg["type"] == "p":
+            # &cr; → 줄바꿈으로 변환 (DSD 특수 개행 마커)
+            text = seg["text"].replace("&cr;", "\n").strip()
+            if text:
+                lines.append(text)
+        elif seg["type"] == "table":
+            lines.append("[테이블]")
+            lines.append(seg.get("text", ""))
+    return "\n".join(lines)
+
+
+async def _llm_parse_note(
+    note_number: str,
+    note_title: str,
+    note_segments: list[dict],
+    llm_client,
+    sem: asyncio.Semaphore,
+) -> DSDNote | None:
+    note_content = _build_note_text(note_segments)
+
+    messages = [
+        {"role": "system", "content": _EXTRACT_SYSTEM},
+        {"role": "user",   "content": _EXTRACT_USER.format(
+            note_number=note_number,
+            note_title=note_title,
+            note_content=note_content[:10000],
+        )},
+    ]
+
+    async with sem:
+        try:
+            result = await asyncio.to_thread(llm_client.chat_json, messages)
+        except Exception as e:
+            logger.error("주석 %s 금액 추출 실패: %s", note_number, e)
+            return None
+
+    return _build_dsd_note(result)
+
+
+def _build_dsd_note(data: dict) -> DSDNote | None:
+    """LLM JSON 응답 → DSDNote."""
+    try:
+        note_number = str(data.get("note_number", "?"))
+        note_title  = str(data.get("note_title",  ""))
+        unit        = str(data.get("unit",         "원"))
+
+        items: list[DSDItem] = []
+        for item_data in data.get("items", []):
+            amounts: list[DSDAmount] = []
+            for amt in item_data.get("amounts", []):
+                amounts.append(DSDAmount(
+                    attributes=dict(amt.get("attributes") or {}),
+                    value=_to_float(amt.get("value")),
+                    raw_text=str(amt.get("raw_text", "")),
+                ))
+            items.append(DSDItem(
+                item_id=item_data.get("item_id", len(items)),
+                label=str(item_data.get("label", "")),
+                is_header_only=bool(item_data.get("is_header_only", False)),
+                amounts=amounts,
+                unit=unit,
+                raw_row={},
+            ))
+
+        return DSDNote(
+            note_number=note_number,
+            note_title=note_title,
+            source_filename="",
+            unit=unit,
+            raw_paragraphs=[],
+            items=items,
+        )
+    except Exception as e:
+        logger.error("DSDNote 변환 실패: %s | 데이터: %s", e, str(data)[:300])
         return None
 
-    # 형식 1: "주석 15. 제목"
-    m = NOTE_PATTERN_EXPLICIT.match(text)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
 
-    # 형식 2: "15. 제목" — 단, "15.1 소제목"처럼 소수점 포함 번호는 제외
-    # 원문에 소수점 숫자(예: "1.1")가 없을 때만 매칭
-    m = NOTE_PATTERN_SIMPLE.match(text)
-    if m:
-        # 하위 항목 제외: 제목 안에 "X.Y" 패턴이 없어야 함
-        # 예: "1.1 연결회사" → NOTE_PATTERN_SIMPLE에서 이미 걸림
-        # ("1.1 연결회사" → 첫 숫자=1, 뒤 ".1 연결회사" → 패턴 불일치)
-        # 실제로는 "1.1" 같은 경우 NOTE_PATTERN_SIMPLE = r"^\s*(\d+)\.\s+(.+)$" 에서
-        # "1.1 연결회사" → (\d+)=1, "1 연결회사" (공백 없음) → 불일치로 OK
-        # 하지만 "1. 일반사항" → OK
-        return m.group(1).strip(), m.group(2).strip()
-
-    return None
+def _to_float(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
 
 
-def _split_into_notes(
-    content: list[dict],
-    source_map: dict[int, str],
-) -> list[DSDNote]:
+# ── 5. 메인 진입점 ────────────────────────────────────────────────────
+
+async def parse_dsd_file(dsd_path: Path, llm_client) -> list[DSDNote]:
     """
-    content 리스트에서 주석 섹션을 분리하여 DSDNote 목록 반환.
+    DSD 파일 → DSDNote 목록.
+
+    1. DSD ZIP에서 contents.xml 직접 추출
+    2. XML → 텍스트 세그먼트 변환
+    3. LLM이 주석 경계(번호·제목) 감지
+    4. LLM이 각 주석 금액 구조화 추출 (병렬, Semaphore 3)
     """
+    logger.info("DSD 파싱 시작 (LLM 모드): %s", dsd_path.name)
+
+    # 1. 세그먼트 추출
+    try:
+        segments = _extract_segments(dsd_path)
+    except Exception as e:
+        raise RuntimeError(f"DSD XML 추출 실패: {e}") from e
+    logger.info("  세그먼트: %d개 (단락+테이블)", len(segments))
+
+    # 2. 주석 경계 감지
+    boundaries = await _llm_find_boundaries(segments, llm_client)
+    if not boundaries:
+        logger.error("주석을 하나도 감지하지 못했습니다.")
+        return []
+    logger.info("  주석 경계: %d개", len(boundaries))
+
+    # 3. 각 주석의 세그먼트 구간 계산
+    chunks: list[tuple[str, str, list[dict]]] = []
+    for i, b in enumerate(boundaries):
+        start = b["segment_index"]
+        end   = boundaries[i + 1]["segment_index"] if i + 1 < len(boundaries) else len(segments)
+        chunks.append((
+            str(b.get("note_number", str(i + 1))),
+            str(b.get("note_title",  "")),
+            segments[start:end],
+        ))
+
+    # 4. 병렬 금액 추출
+    sem = asyncio.Semaphore(3)
+    tasks = [
+        _llm_parse_note(num, title, segs, llm_client, sem)
+        for num, title, segs in chunks
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     notes: list[DSDNote] = []
-    current_note_num: str | None = None
-    current_note_title: str = ""
-    current_source: str = "unknown"
-    current_paragraphs: list[str] = []
-    current_tables: list[list[dict]] = []
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning("주석 파싱 오류 (건너뜀): %s", r)
+        elif r is not None:
+            notes.append(r)
 
-    def _flush_note():
-        if current_note_num is None:
-            return
-        items = _build_items_from_tables(current_tables, current_note_num)
-        note_unit = _detect_unit_from_paragraphs(current_paragraphs)
-        # 단위 정규화 적용 (퍼센트 컬럼 제외)
-        for item in items:
-            item.unit = note_unit
-            for amt in item.amounts:
-                if amt.value is not None and amt.attributes.get("_is_pct") != "true":
-                    amt.value = normalize_unit(amt.value, note_unit)
-        notes.append(
-            DSDNote(
-                note_number=current_note_num,
-                note_title=current_note_title,
-                source_filename=current_source,
-                unit=note_unit,
-                raw_paragraphs=list(current_paragraphs),
-                items=items,
-            )
-        )
-
-    for idx, entry in enumerate(content):
-        source = source_map.get(idx, "unknown")
-
-        if "p" in entry:
-            text = entry["p"]
-            header = _detect_note_header(text)
-            if header:
-                _flush_note()
-                current_note_num, current_note_title = header
-                current_source = source
-                current_paragraphs = [text]
-                current_tables = []
-            else:
-                if current_note_num is not None:
-                    current_paragraphs.append(text)
-
-        elif "table" in entry:
-            if current_note_num is not None:
-                current_tables.append(entry["table"])
-
-    _flush_note()
+    notes.sort(key=lambda n: int(n.note_number) if n.note_number.isdigit() else 999)
+    logger.info("DSD 파싱 완료: 주석 %d개", len(notes))
     return notes
-
-
-def _detect_unit_from_paragraphs(paragraphs: list[str]) -> str:
-    for p in paragraphs:
-        unit = detect_unit_from_text(p)
-        if unit != "원":
-            return unit
-    return "원"
-
-
-def _build_items_from_tables(
-    tables: list[list[dict]],
-    note_number: str,
-) -> list[DSDItem]:
-    """
-    테이블 목록을 DSDItem 리스트로 변환.
-    """
-    items: list[DSDItem] = []
-    item_id = 0
-
-    for table in tables:
-        for raw_row in table:
-            flat = flatten_dict(raw_row) if _is_nested(raw_row) else raw_row
-
-            # 레이블 컬럼 찾기
-            label = _extract_label(flat)
-            if label is None:
-                label = ""
-
-            # 금액 컬럼 추출 (레이블 컬럼 제외)
-            amounts = _extract_amounts(flat)
-
-            is_header_only = len(amounts) == 0
-
-            items.append(
-                DSDItem(
-                    item_id=item_id,
-                    label=label,
-                    is_header_only=is_header_only,
-                    amounts=amounts,
-                    unit="원",  # 나중에 note 단위로 덮어씀
-                    raw_row=raw_row,
-                )
-            )
-            item_id += 1
-
-    return items
-
-
-def _is_nested(d: dict) -> bool:
-    return any(isinstance(v, dict) for v in d.values())
-
-
-def _extract_label(flat: dict) -> str | None:
-    """
-    레이블 컬럼 키 우선순위로 레이블 텍스트 반환.
-    """
-    for col in LABEL_COLUMNS:
-        if col in flat and isinstance(flat[col], str) and flat[col].strip():
-            return flat[col].strip()
-
-    # LABEL_COLUMNS에 없어도 값이 숫자가 아닌 첫 번째 컬럼을 레이블로 사용
-    for k, v in flat.items():
-        if isinstance(v, str) and parse_amount(v) is None and v.strip():
-            return v.strip()
-
-    return None
-
-
-def _extract_amounts(flat: dict) -> list[DSDAmount]:
-    """
-    flat dict에서 금액 컬럼들을 DSDAmount 리스트로 변환.
-    attributes는 "." 구분 경로를 split하여 구성.
-    """
-    amounts: list[DSDAmount] = []
-
-    for key, raw_val in flat.items():
-        if not isinstance(raw_val, str):
-            continue
-
-        # 레이블 컬럼 스킵
-        base_key = key.split(".")[0] if "." in key else key
-        if base_key in LABEL_COLUMNS:
-            continue
-        if key in LABEL_COLUMNS:
-            continue
-
-        # 퍼센트/비율 컬럼은 금액 단위 변환 대상 제외 표시
-        is_pct_col = "%" in key or "율" in key or "비율" in key
-
-        value = parse_amount(raw_val)
-
-        # 빈 값 & 변환 불가 → 금액 없음 (label-only 컬럼일 수도)
-        if value is None and raw_val.strip() not in ("", "-", "—", "–"):
-            # 텍스트 값이면 레이블로 보고 스킵
-            if not raw_val.strip().lstrip("(").rstrip(")").replace(",", "").replace(".", "").isdigit():
-                continue
-
-        # 속성 구성: "당기.수준1" → {"col_0": "당기", "col_1": "수준1"}
-        parts = [p.strip() for p in key.split(".") if p.strip()]
-        attributes = _parts_to_attributes(parts)
-
-        # 퍼센트 컬럼은 is_pct=True 속성을 attributes에 표시
-        if is_pct_col:
-            attributes["_is_pct"] = "true"
-
-        amounts.append(
-            DSDAmount(
-                attributes=attributes,
-                value=value,
-                raw_text=raw_val,
-            )
-        )
-
-    return amounts
-
-
-def _parts_to_attributes(parts: list[str]) -> dict[str, str]:
-    """
-    헤더 경로 parts → attributes dict.
-    첫 번째 depth는 주로 기간(당기/전기).
-    """
-    if not parts:
-        return {}
-
-    # 휴리스틱 키 이름 추정
-    PERIOD_VALUES = {"당기", "전기", "current", "prior", "현재", "비교"}
-    LEVEL_HINTS = {"수준", "level", "등급"}
-    MATURITY_HINTS = {"이내", "초과", "만기", "1년", "이상"}
-
-    attr: dict[str, str] = {}
-
-    for i, part in enumerate(parts):
-        lower = part.lower()
-        if i == 0:
-            if any(v in part for v in PERIOD_VALUES):
-                key = "기간"
-            else:
-                key = "col_0"
-        elif i == 1:
-            if any(h in lower for h in LEVEL_HINTS):
-                key = "수준"
-            elif any(h in lower for h in MATURITY_HINTS):
-                key = "만기"
-            else:
-                key = f"col_{i}"
-        else:
-            key = f"col_{i}"
-
-        # 중복 키 방지
-        if key in attr:
-            key = f"{key}_{i}"
-
-        attr[key] = part
-
-    return attr

@@ -253,7 +253,8 @@ def _clean_pdf_page(text: str) -> str:
         if re.match(r"December 31,\s*\d{4}", stripped, re.IGNORECASE):
             continue
         # 하이픈으로 끊긴 단어 복원
-        if cleaned and cleaned[-1].endswith("-"):
+        # 단, 재무표 null 표시(" -", "0 -" 등)는 제외 — 앞이 알파벳일 때만 병합
+        if cleaned and re.search(r"[a-zA-Z]-$", cleaned[-1]):
             cleaned[-1] = cleaned[-1][:-1] + stripped
         else:
             cleaned.append(stripped)
