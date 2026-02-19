@@ -39,6 +39,7 @@ async def reconcile_all(
     mappings: list[NoteMapping],
     llm_client: BaseLLMClient,
     progress_cb: Callable[[int, str], None] | None = None,
+    warn_cb: Callable[[str], None] | None = None,
 ) -> list[ReconcileResult]:
     """
     매핑된 주석 쌍 전체를 병렬 대사하여 ReconcileResult 목록 반환.
@@ -55,7 +56,7 @@ async def reconcile_all(
     async def run_one(mapping: NoteMapping) -> ReconcileResult:
         nonlocal completed
         async with semaphore:
-            result = await _reconcile_one(mapping, llm_client)
+            result = await _reconcile_one(mapping, llm_client, warn_cb=warn_cb)
         async with lock:
             completed += 1
             step_msg = f"주석 {mapping.kr_note.note_number} 대사 완료 ({completed}/{total})"
@@ -85,6 +86,7 @@ async def reconcile_all(
 async def _reconcile_one(
     mapping: NoteMapping,
     llm_client: BaseLLMClient,
+    warn_cb: Callable[[str], None] | None = None,
 ) -> ReconcileResult:
     kr_note = mapping.kr_note
     en_note = mapping.en_note
@@ -123,7 +125,7 @@ async def _reconcile_one(
         )
 
     # LLM 대사 실행 (이미 빌드된 payload 전달로 중복 빌드 방지)
-    llm_responses = await _call_llm_reconcile(kr_note, en_note, llm_client, dsd_payload)
+    llm_responses = await _call_llm_reconcile(kr_note, en_note, llm_client, dsd_payload, warn_cb=warn_cb)
 
     # LLM 응답 → ReconcileItem 변환
     items = _build_reconcile_items(kr_note.items, llm_responses)
@@ -147,6 +149,7 @@ async def _call_llm_reconcile(
     en_note: EnNote,
     llm_client: BaseLLMClient,
     dsd_items_payload: list[dict] | None = None,
+    warn_cb: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """
     주석 1쌍에 대해 LLM 대사 호출.
@@ -158,9 +161,15 @@ async def _call_llm_reconcile(
 
     try:
         return await _llm_single_call(kr_note, en_note, dsd_items_payload, llm_client)
-    except (ValueError, Exception) as e:
+    except Exception as e:
+        warn_msg = f"[경고] 주석 {kr_note.note_number} ({kr_note.note_title}): LLM 응답 오류 — 청크 재시도 중"
         logger.warning("주석 %s LLM 단일 호출 실패 (%s) — 청크 fallback 적용", kr_note.note_number, e)
-        return await _llm_chunked_call(kr_note, en_note, llm_client)
+        if warn_cb:
+            warn_cb(warn_msg)
+        results = await _llm_chunked_call(kr_note, en_note, llm_client)
+        if not results and warn_cb:
+            warn_cb(f"[경고] 주석 {kr_note.note_number} ({kr_note.note_title}): 청크 재시도도 실패 — 해당 주석 대사 불가")
+        return results
 
 
 async def _llm_single_call(
@@ -220,7 +229,12 @@ def _build_system_prompt() -> str:
     return (
         "당신은 한국 Big4 회계법인의 시니어 감사 전문가입니다.\n"
         "국문 재무제표(DSD 기반)와 영문 재무제표를 대사(reconciliation)하는 업무를 수행합니다.\n\n"
-        "규칙:\n"
+        "【절대 규칙 — 반드시 준수】\n"
+        "응답은 반드시 JSON 배열([ ... ]) 하나만 반환하세요.\n"
+        "텍스트 설명, 마크다운(```), 주석, 어떤 부가 문장도 포함하지 마세요.\n"
+        "영문 원문에 숫자가 없거나 테이블이 비어있는 경우에도 JSON 배열로 반환하고,\n"
+        "해당 항목은 found=false, value_en=null로 처리하세요. 절대 설명문을 반환하지 마세요.\n\n"
+        "대사 규칙:\n"
         "1. 국문 항목 목록의 각 금액(amount_id별)에 대응하는 영문 금액을 영문 원문에서 찾으세요.\n"
         "2. 기계적 텍스트 매칭이 아닌, 회계 전문가로서 문맥과 의미를 이해하고 판단하세요.\n"
         "3. 영문에서 합계/소계 레이블이 없어도 숫자의 위치와 맥락으로 판단하세요.\n"
@@ -231,8 +245,7 @@ def _build_system_prompt() -> str:
         "   예: '₩246 million' → value_en=246, '₩1,366,255 thousand' → value_en=1366255\n"
         "7. reasoning 필드는 반드시 한국어로 작성하세요.\n"
         "   - found=true이고 금액이 일치할 것으로 보이면 reasoning을 빈 문자열(\"\")로 반환하세요.\n"
-        "   - found=false(미발견)이거나 금액 불일치가 의심될 때만 구체적인 이유를 한국어로 작성하세요.\n"
-        "8. 반드시 JSON 배열만 반환하세요 (다른 텍스트, 마크다운 금지)."
+        "   - found=false(미발견)이거나 금액 불일치가 의심될 때만 구체적인 이유를 한국어로 작성하세요."
     )
 
 

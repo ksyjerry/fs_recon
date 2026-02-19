@@ -22,18 +22,26 @@ logger = logging.getLogger(__name__)
 class BaseLLMClient(ABC):
 
     @abstractmethod
-    def chat(self, messages: list[dict], temperature: float = 0.0) -> str:
-        """messages: [{"role": "user"|"assistant"|"system", "content": "..."}]"""
+    def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.0,
+        response_format: dict | None = None,
+    ) -> str:
+        """messages: [{"role": "user"|"assistant"|"system", "content": "..."}]
+        response_format: {"type": "json_object"} 등 OpenAI 호환 포맷 지정 (선택)
+        """
         ...
 
     def chat_json(self, messages: list[dict]) -> dict | list:
         """
         JSON 응답 보장 버전.
-        마크다운 코드블록 자동 제거 후 파싱.
+        response_format={"type": "json_object"} 로 JSON mode 활성화.
+        마크다운 코드블록 자동 제거 후 파싱 (안전망).
         응답이 절단된 경우 완전한 객체만 부분 복구.
         파싱 실패 시 ValueError 발생.
         """
-        raw = self.chat(messages, temperature=0.0)
+        raw = self.chat(messages, temperature=0.0, response_format={"type": "json_object"})
         cleaned = raw.strip()
 
         # ```json ... ``` 또는 ``` ... ``` 블록 제거
@@ -129,14 +137,24 @@ class PwCLLMClient(BaseLLMClient):
         }
         self.model = settings.PwC_LLM_MODEL
 
-    def chat(self, messages: list[dict], temperature: float = 0.0) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.0,
+        response_format: dict | None = None,
+    ) -> str:
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": 65536,
         }
-        logger.debug("PwC LLM 호출: model=%s, messages=%d개", self.model, len(messages))
+        if response_format is not None:
+            payload["response_format"] = response_format
+        logger.debug(
+            "PwC LLM 호출: model=%s, messages=%d개, json_mode=%s",
+            self.model, len(messages), response_format is not None,
+        )
 
         # 재시도 대상 HTTP 상태코드 (일시적 서버 오류)
         RETRYABLE_STATUS = {429, 500, 502, 503, 504}

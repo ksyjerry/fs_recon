@@ -166,7 +166,15 @@ async def _run_reconciliation(
         def progress_with_log(pct: int, msg: str) -> None:
             update_job(job_id, progress=pct, step=msg)
 
-        results = await reconcile_all(mappings, llm_client, progress_cb=progress_with_log)
+        def warn_log(msg: str) -> None:
+            logger.warning("[%s] %s", job_id, msg)
+            append_log(job_id, msg)
+
+        results = await reconcile_all(
+            mappings, llm_client,
+            progress_cb=progress_with_log,
+            warn_cb=warn_log,
+        )
         msg4 = f"LLM 대사 완료: {len(results)}개 주석 처리됨"
         logger.info("[%s] %s", job_id, msg4)
         append_log(job_id, msg4)
