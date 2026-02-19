@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* PwC Brand Colors */
+  --pwc-orange:     #E8400C;
+  --pwc-orange-dk:  #C4380A;
+  --pwc-red:        #E0301E;
+  --pwc-black:      #1A1A1A;
+  --pwc-grey-90:    #2D2D2D;
+  --pwc-grey-70:    #4D4D4D;
+  --pwc-grey-20:    #CCCCCC;
+  --pwc-grey-05:    #F5F5F5;
+  --pwc-white:      #FFFFFF;
+
+  /* Semantic */
+  --color-success:  #22A354;
+  --color-warning:  #F5A623;
+  --color-danger:   #E0301E;
+
+  /* Typography */
+  --font-display: 'PwC Helvetica Neue', 'Helvetica Neue', Helvetica, sans-serif;
+  --font-body:    'PwC Helvetica Neue', 'Helvetica Neue', Helvetica, sans-serif;
+
+  /* Spacing (8px grid) */
+  --space-xs:  4px;
+  --space-sm:  8px;
+  --space-md:  16px;
+  --space-lg:  24px;
+  --space-xl:  40px;
+  --space-2xl: 64px;
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--pwc-black);
+  background-color: var(--pwc-white);
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}

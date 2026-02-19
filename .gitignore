@@ -1,0 +1,31 @@
+# 환경변수 (API 키 포함)
+.env
+
+# 임시 파일
+temp/
+*.dsd
+*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+*.egg
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Claude Code
+.claude/
+
+# 에디터
+.DS_Store
+.idea/
+.vscode/
+*.swp
