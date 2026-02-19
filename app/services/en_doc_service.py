@@ -138,12 +138,12 @@ async def _parse_word(file_path: Path) -> EnDocument:
         )
         sections = _word_regex_sections(doc, body_elements, para_elements, table_elements)
 
-    # regex 기반도 3개 미만이면 bold 단락 감지 재시도
+    # regex 기반도 3개 미만이면 bold 단락 감지 재시도 (numbering.xml 파싱 포함)
     if len(sections) < 3:
         logger.warning(
-            "Word regex 기반 Note %d개 — bold 단락 감지 재시도", len(sections)
+            "Word regex 기반 Note %d개 — bold 단락 감지 재시도 (numbering.xml 파싱 포함)", len(sections)
         )
-        sections = _word_bold_sections(body_elements, para_elements, table_elements)
+        sections = _word_bold_sections(body_elements, para_elements, table_elements, doc=doc)
 
     full_text = "\n\n".join(
         "\n".join(lines) for _, _, lines in sections
@@ -250,6 +250,81 @@ def _word_regex_sections(
 
 
 _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_NS_W_CURLY = f"{{{_NS_W}}}"
+
+
+def _compute_list_sequence(doc, body_elements: list, para_elements: dict) -> dict[int, int]:
+    """
+    numbering.xml을 파싱하여 각 ilvl=0 List Paragraph의 실제 자동번호를 계산.
+    반환: {id(para_element): 실제_번호}
+
+    Word 자동번호는 numbering.xml의 <w:abstractNum> → <w:num> 구조로 정의됨:
+      - <w:start> : 해당 레벨의 시작 번호 (보통 1)
+      - 각 단락이 등장할 때마다 해당 (numId, ilvl) 카운터 증가
+    """
+    try:
+        num_part = doc.part.numbering_part
+        if num_part is None:
+            return {}
+        num_xml = num_part.element
+    except Exception:
+        return {}
+
+    W = _NS_W_CURLY
+
+    # numId → abstractNumId 매핑
+    num_to_abstract: dict[int, int] = {}
+    for num_el in num_xml.findall(f"{W}num"):
+        num_id = int(num_el.get(f"{W}numId", 0))
+        ab_ref = num_el.find(f"{W}abstractNumId")
+        if ab_ref is not None:
+            num_to_abstract[num_id] = int(ab_ref.get(f"{W}val", 0))
+
+    # abstractNumId + ilvl → 시작번호
+    abstract_starts: dict[tuple[int, int], int] = {}
+    for ab in num_xml.findall(f"{W}abstractNum"):
+        ab_id = int(ab.get(f"{W}abstractNumId", 0))
+        for lvl in ab.findall(f"{W}lvl"):
+            ilvl = int(lvl.get(f"{W}ilvl", 0))
+            start_el = lvl.find(f"{W}start")
+            start = int(start_el.get(f"{W}val", 1)) if start_el is not None else 1
+            abstract_starts[(ab_id, ilvl)] = start
+
+    # 단락 순회하며 (numId, ilvl) 카운터 증가
+    counters: dict[tuple[int, int], int] = {}
+    result: dict[int, int] = {}
+
+    for elem in body_elements:
+        elem_id = id(elem)
+        if elem_id not in para_elements:
+            continue
+        para = para_elements[elem_id]
+
+        num_pr = para._element.find(f".//{W}numPr")
+        if num_pr is None:
+            continue
+
+        num_id_el = num_pr.find(f"{W}numId")
+        ilvl_el = num_pr.find(f"{W}ilvl")
+        if num_id_el is None or ilvl_el is None:
+            continue
+
+        num_id = int(num_id_el.get(f"{W}val", 0))
+        ilvl   = int(ilvl_el.get(f"{W}val", 0))
+        key    = (num_id, ilvl)
+
+        if key not in counters:
+            ab_id = num_to_abstract.get(num_id, 0)
+            counters[key] = abstract_starts.get((ab_id, ilvl), 1)
+        else:
+            counters[key] += 1
+
+        # ilvl=0만 Note 제목 후보 → 실제 번호 기록
+        if ilvl == 0:
+            result[id(elem)] = counters[key]
+
+    return result
+
 
 # bold 단락 감지 시 제목으로 보기 어려운 패턴
 _BODY_TEXT_RE = re.compile(
@@ -289,18 +364,27 @@ def _word_bold_sections(
     body_elements: list,
     para_elements: dict,
     table_elements: dict,
+    doc=None,
 ) -> list[tuple[str, str, list[str]]]:
     """
-    3단계 fallback: bold 단락을 Note 제목으로 감지.
-    - List Paragraph ilvl=0: 최상위 자동번호 항목
-    - bold 바탕글/Normal 단락 (≤70자): 스타일 없는 bold 제목
-    위 두 종류를 Note 제목으로 사용하고 순번을 자동 부여.
+    3단계 fallback: bold 단락 / List Paragraph(ilvl=0)을 Note 제목으로 감지.
+
+    doc가 전달되면 numbering.xml을 파싱하여 실제 자동번호를 읽음.
+    실제 번호를 읽을 수 있으면 그대로 사용하고,
+    없으면 "B1", "B2" 형태로 부여(국문 순번과 겹치지 않도록 B-prefix).
     """
+    # numbering.xml에서 실제 자동번호 계산 (doc가 있는 경우)
+    list_seq: dict[int, int] = {}
+    if doc is not None:
+        list_seq = _compute_list_sequence(doc, body_elements, para_elements)
+        if list_seq:
+            logger.info("numbering.xml 파싱 성공: %d개 ilvl=0 항목의 실제 번호 확인", len(list_seq))
+
     sections: list[tuple[str, str, list[str]]] = []
     current_num: str | None = None
     current_title: str = ""
     current_lines: list[str] = []
-    note_counter = 0
+    b_counter = 0  # numbering.xml 실패 시 B-prefix 순번용
 
     def flush():
         nonlocal current_num, current_title, current_lines
@@ -324,16 +408,22 @@ def _word_bold_sections(
 
             ilvl = _get_para_ilvl(para)
             is_list_top = (style == "List Paragraph" and ilvl == 0)
-            # List Paragraph는 ilvl=0만 is_list_top으로 처리
             # ilvl=1 이상(회계정책 하위섹션 등)은 bold여도 Note 제목으로 보지 않음
             is_bold_hdr = _is_bold_title(para) and style in ("바탕글", "Normal")
 
             if (is_list_top or is_bold_hdr) and text not in seen_titles:
                 flush()
-                note_counter += 1
-                # "B1", "B2" 형태로 부여 → 국문 순번(1, 2, 3...)과 겹치지 않아
-                # mapping_service에서 번호 매핑을 건너뛰고 LLM 제목 매핑으로 처리됨
-                current_num = f"B{note_counter}"
+
+                # 실제 자동번호를 읽을 수 있으면 그대로 사용 (번호 매핑 가능)
+                actual_num = list_seq.get(id(elem))
+                if actual_num is not None:
+                    current_num = str(actual_num)
+                    logger.debug("Word 자동번호 실제값 사용: %s → '%s'", current_num, text)
+                else:
+                    # B-prefix: 국문 순번과 충돌 방지 → LLM 제목 매핑 경로로 유도
+                    b_counter += 1
+                    current_num = f"B{b_counter}"
+
                 current_title = text
                 current_lines = [text]
                 seen_titles.add(text)
