@@ -18,6 +18,29 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────
 _NOTE_RE = re.compile(r"^\s*(\d+)\.\s+([A-Z][^\n]{0,120})$")
 
+# ─────────────────────────────────────────────────────
+# 영문 재무제표 본문 타입 패턴 (FS)
+# ─────────────────────────────────────────────────────
+_EN_FS_PATTERNS: dict[str, re.Pattern] = {
+    "balance_sheet": re.compile(
+        r"statement[s]?\s+of\s+financial\s+position|balance\s+sheet", re.I),
+    "income_statement": re.compile(
+        r"statement[s]?\s+of\s+(?:profit(?:\s+or\s+loss)?|comprehensive\s+income|operations|income)"
+        r"|income\s+statement|profit(?:\s+and\s+loss)?(?:\s+statement)?|statement[s]?\s+of\s+earnings",
+        re.I),
+    "equity_changes": re.compile(
+        r"statement[s]?\s+of\s+changes\s+in\s+(?:equity|stockholders|shareholders)", re.I),
+    "cash_flow": re.compile(
+        r"statement[s]?\s+of\s+cash\s+flows?|cash\s+flow\s+statement", re.I),
+}
+
+_EN_FS_TITLES: dict[str, str] = {
+    "balance_sheet":    "Statement of Financial Position",
+    "income_statement": "Statement of Profit or Loss",
+    "equity_changes":   "Statement of Changes in Equity",
+    "cash_flow":        "Statement of Cash Flows",
+}
+
 # 페이지 헤더/푸터 노이즈 패턴 (PDF 특화)
 _PDF_HEADER_RE = re.compile(
     r"(GOWOONSESANG.{0,80}Notes to.{0,80}December 31)",
@@ -615,3 +638,144 @@ def _sections_to_notes(
             )
         )
     return notes
+
+
+# ─────────────────────────────────────────────────────
+# 영문 재무제표 본문 파싱 (FS)
+# ─────────────────────────────────────────────────────
+
+async def parse_en_financial_statements(file_path: Path) -> dict[str, "EnNote"]:
+    """
+    영문 재무제표 파일에서 본문 4종(재무상태표/손익계산서/자본변동표/현금흐름표)을 추출.
+    반환: {"balance_sheet": EnNote, "income_statement": EnNote, ...}
+    찾지 못한 종류는 딕셔너리에 포함되지 않음.
+    """
+    suffix = file_path.suffix.lower()
+    if suffix == ".docx":
+        return await _parse_en_fs_word(file_path)
+    elif suffix == ".pdf":
+        return await _parse_en_fs_pdf(file_path)
+    else:
+        with open(file_path, "rb") as f:
+            header = f.read(4)
+        if header == b"PK\x03\x04":
+            return await _parse_en_fs_word(file_path)
+        elif header[:4] == b"%PDF":
+            return await _parse_en_fs_pdf(file_path)
+        return {}
+
+
+async def _parse_en_fs_word(file_path: Path) -> dict[str, "EnNote"]:
+    """Word 파일에서 영문 재무제표 본문 섹션 추출."""
+    import docx
+
+    doc = docx.Document(str(file_path))
+    body_elements = list(doc.element.body)
+    para_elements = {id(p._element): p for p in doc.paragraphs}
+    table_elements = {id(t._element): t for t in doc.tables}
+
+    # fs_type → 수집 중인 라인 목록
+    current_fs: str | None = None
+    current_title: str = ""
+    accumulated: dict[str, list[str]] = {}  # fs_type → lines
+    accumulated_titles: dict[str, str] = {}
+
+    def flush_fs():
+        nonlocal current_fs, current_title
+        if current_fs is not None and current_fs not in accumulated:
+            accumulated[current_fs] = []
+            accumulated_titles[current_fs] = current_title
+        current_fs = None
+
+    for elem in body_elements:
+        elem_id = id(elem)
+
+        if elem_id in para_elements:
+            para = para_elements[elem_id]
+            text = para.text.strip()
+            if not text or _PAGE_NUM_RE.match(text):
+                continue
+
+            # FS 타입 제목 감지
+            detected = False
+            for fs_type, pat in _EN_FS_PATTERNS.items():
+                if fs_type not in accumulated and pat.search(text) and len(text) < 120:
+                    flush_fs()
+                    current_fs = fs_type
+                    current_title = text
+                    accumulated[fs_type] = [text]
+                    accumulated_titles[fs_type] = text
+                    detected = True
+                    break
+
+            if not detected and current_fs is not None:
+                accumulated[current_fs].append(text)
+
+        elif elem_id in table_elements:
+            if current_fs is None:
+                continue
+            table = table_elements[elem_id]
+            table_text = _table_to_text(table)
+            if table_text:
+                accumulated[current_fs].append(table_text)
+
+    result: dict[str, EnNote] = {}
+    for fs_type, lines in accumulated.items():
+        raw_text = "\n".join(lines)
+        result[fs_type] = EnNote(
+            note_number=fs_type,
+            note_title=accumulated_titles.get(fs_type, _EN_FS_TITLES.get(fs_type, fs_type)),
+            raw_text=raw_text,
+            source_format=DocFormat.WORD,
+        )
+
+    logger.info("영문 FS 파싱 완료 (Word): %d종 %s", len(result), list(result.keys()))
+    return result
+
+
+async def _parse_en_fs_pdf(file_path: Path) -> dict[str, "EnNote"]:
+    """PDF 파일에서 영문 재무제표 본문 섹션 추출."""
+    import pdfplumber
+
+    all_lines: list[str] = []
+
+    with pdfplumber.open(str(file_path)) as pdf:
+        for page in pdf.pages:
+            raw = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+            cleaned = _clean_pdf_page(raw)
+            if cleaned.strip():
+                all_lines.extend(cleaned.split("\n"))
+
+    current_fs: str | None = None
+    accumulated: dict[str, list[str]] = {}
+    accumulated_titles: dict[str, str] = {}
+
+    for line in all_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        detected = False
+        for fs_type, pat in _EN_FS_PATTERNS.items():
+            if fs_type not in accumulated and pat.search(stripped) and len(stripped) < 120:
+                current_fs = fs_type
+                accumulated[fs_type] = [stripped]
+                accumulated_titles[fs_type] = stripped
+                detected = True
+                break
+
+        if not detected and current_fs is not None:
+            accumulated[current_fs].append(stripped)
+
+    result: dict[str, EnNote] = {}
+    for fs_type, lines in accumulated.items():
+        raw_text = "\n".join(lines)
+        result[fs_type] = EnNote(
+            note_number=fs_type,
+            note_title=accumulated_titles.get(fs_type, _EN_FS_TITLES.get(fs_type, fs_type)),
+            raw_text=raw_text,
+            source_format=DocFormat.PDF,
+        )
+
+    logger.info("영문 FS 파싱 완료 (PDF): %d종 %s", len(result), list(result.keys()))
+    return result

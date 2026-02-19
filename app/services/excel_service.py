@@ -26,6 +26,14 @@ from app.services.mapping_service import NoteMapping
 
 logger = logging.getLogger(__name__)
 
+# FS 타입 → 한글 시트명
+_FS_SHEET_NAMES: dict[str, str] = {
+    "balance_sheet":    "FS_재무상태표",
+    "income_statement": "FS_손익계산서",
+    "equity_changes":   "FS_자본변동표",
+    "cash_flow":        "FS_현금흐름표",
+}
+
 # ─── 색상 ───────────────────────────────────────────────────────
 C_MATCH      = "C6EFCE"   # 연초록 — 일치
 C_MISMATCH   = "FFC7CE"   # 연빨강 — 불일치
@@ -80,17 +88,29 @@ async def generate_excel(
     mappings: list[NoteMapping],
     company_name: str,
     output_dir: Path,
+    stmt_results: list[ReconcileResult] | None = None,
+    stmt_mappings: list[NoteMapping] | None = None,
 ) -> Path:
     """
     대사 결과를 Excel 파일로 저장.
+    stmt_results/stmt_mappings: 재무제표 본문 대사 결과 (없으면 기존 주석만)
     반환: 저장된 파일 경로
     """
+    stmt_results  = stmt_results  or []
+    stmt_mappings = stmt_mappings or []
+
     wb = Workbook()
     wb.remove(wb.active)  # 기본 Sheet 제거
 
-    _write_summary(wb, results, mappings, company_name)
-    _write_mapping_log(wb, mappings)
-    _write_mismatches(wb, results)
+    _write_summary(wb, results, mappings, company_name, stmt_results, stmt_mappings)
+    _write_mapping_log(wb, mappings, stmt_mappings)
+    _write_mismatches(wb, results + stmt_results)
+
+    # FS 시트 (Summary 직후, 주석 시트 전)
+    for result in stmt_results:
+        sheet_name = _FS_SHEET_NAMES.get(result.note_number_kr, f"FS_{result.note_number_kr}")
+        _write_note_sheet(wb, result, sheet_name=sheet_name)
+
     for result in results:
         _write_note_sheet(wb, result)
 
@@ -107,7 +127,17 @@ async def generate_excel(
 
 # ─── Summary 시트 ────────────────────────────────────────────────
 
-def _write_summary(wb: Workbook, results: list[ReconcileResult], mappings: list[NoteMapping], company_name: str):
+def _write_summary(
+    wb: Workbook,
+    results: list[ReconcileResult],
+    mappings: list[NoteMapping],
+    company_name: str,
+    stmt_results: list[ReconcileResult] | None = None,
+    stmt_mappings: list[NoteMapping] | None = None,
+):
+    stmt_results  = stmt_results  or []
+    stmt_mappings = stmt_mappings or []
+
     ws = wb.create_sheet("Summary")
     ws.sheet_view.showGridLines = False
 
@@ -124,16 +154,17 @@ def _write_summary(wb: Workbook, results: list[ReconcileResult], mappings: list[
     ws["A2"].font = _font(size=9, color="666666")
     ws["A2"].alignment = _align("right")
 
-    # 집계 요약
-    total_amounts = sum(r.total_amounts for r in results)
-    total_matched = sum(r.matched_count for r in results)
+    # 전체 집계 (주석 + FS)
+    all_results = stmt_results + results
+    total_amounts = sum(r.total_amounts for r in all_results)
+    total_matched = sum(r.matched_count for r in all_results)
     total_miss    = sum(
         sum(1 for i in r.items for m in i.amount_matches if m.is_match is False)
-        for r in results
+        for r in all_results
     )
     total_nf      = sum(
         sum(1 for i in r.items for m in i.amount_matches if not m.found)
-        for r in results
+        for r in all_results
     )
     overall_rate  = total_matched / total_amounts if total_amounts else 0
 
@@ -147,60 +178,83 @@ def _write_summary(wb: Workbook, results: list[ReconcileResult], mappings: list[
     ws["A3"].fill = _fill("F2F2F2")
 
     # 헤더
-    headers = ["주석번호", "국문 주석 제목", "영문 Note 제목",
+    headers = ["번호/구분", "국문 제목", "영문 제목",
                "총 금액수", "일치", "불일치", "미발견", "일치율", "매핑방법"]
     header_row = 5
+
+    def _write_section_header(ws, row: int, label: str):
+        ws.merge_cells(f"A{row}:I{row}")
+        c = ws[f"A{row}"]
+        c.value = label
+        c.font = _font(bold=True, color="FFFFFF")
+        c.fill = _fill("455A64")
+        c.alignment = _align("left")
+
+    def _write_data_rows(ws, result_list, mapping_list, start_row: int) -> int:
+        mapping_by_num = {m.kr_note.note_number: m for m in mapping_list}
+        row_idx = start_row
+        for r in result_list:
+            miss  = sum(1 for i in r.items for m in i.amount_matches if m.is_match is False)
+            nf    = sum(1 for i in r.items for m in i.amount_matches if not m.found)
+            rate  = r.match_rate
+            mapping = mapping_by_num.get(r.note_number_kr)
+            method  = mapping.method if mapping else "-"
+            row_fill = _fill(C_SUMMARY_NG if (miss > 0 or nf > 0) else "FFFFFF")
+
+            vals = [
+                r.note_number_kr,
+                r.note_title_kr,
+                r.note_title_en or "—",
+                r.total_amounts,
+                r.matched_count,
+                miss,
+                nf,
+                None,
+                method,
+            ]
+            for col, val in enumerate(vals, 1):
+                cell = _write_cell(ws, row_idx, col, val, fill=row_fill)
+                if col == 1:
+                    cell.alignment = _align("center")
+                if col == 4:
+                    cell.alignment = _align("right")
+
+            miss_cell = ws.cell(row=row_idx, column=6)
+            if miss > 0:
+                miss_cell.fill = _fill(C_MISMATCH)
+                miss_cell.font = _font(bold=True)
+
+            rate_cell = ws.cell(row=row_idx, column=8, value=rate)
+            rate_cell.number_format = "0.0%"
+            rate_cell.fill = row_fill
+            rate_cell.border = _border()
+            rate_cell.alignment = _align("center")
+
+            row_idx += 1
+        return row_idx
+
     for col, h in enumerate(headers, 1):
         _write_cell(ws, header_row, col, h,
                     fill=_fill(C_HEADER),
                     font=_font(bold=True, color="FFFFFF"),
                     align=_align("center"))
 
-    # 데이터
-    mapping_by_num = {m.kr_note.note_number: m for m in mappings}
-    for row_idx, r in enumerate(results, header_row + 1):
-        miss  = sum(1 for i in r.items for m in i.amount_matches if m.is_match is False)
-        nf    = sum(1 for i in r.items for m in i.amount_matches if not m.found)
-        rate  = r.match_rate
-        mapping = mapping_by_num.get(r.note_number_kr)
-        method  = mapping.method if mapping else "-"
+    next_row = header_row + 1
 
-        # 미일치 또는 미발견 1건 이상 → 행 전체 연빨강, 없으면 흰색
-        row_fill = _fill(C_SUMMARY_NG if (miss > 0 or nf > 0) else "FFFFFF")
+    # FS 섹션 (있는 경우)
+    if stmt_results:
+        _write_section_header(ws, next_row, "■ 재무제표 본문")
+        next_row += 1
+        next_row = _write_data_rows(ws, stmt_results, stmt_mappings, next_row)
 
-        vals = [
-            r.note_number_kr,
-            r.note_title_kr,
-            r.note_title_en or "—",
-            r.total_amounts,
-            r.matched_count,
-            miss,
-            nf,
-            None,   # 일치율 — 숫자 형식 별도 처리
-            method,
-        ]
-        for col, val in enumerate(vals, 1):
-            cell = _write_cell(ws, row_idx, col, val, fill=row_fill)
-            if col == 1:
-                cell.alignment = _align("center")
-            if col == 4:
-                cell.alignment = _align("right")
-
-        # 불일치 수 셀: 1 이상이면 빨간 강조
-        miss_cell = ws.cell(row=row_idx, column=6)
-        if miss > 0:
-            miss_cell.fill = _fill(C_MISMATCH)
-            miss_cell.font = _font(bold=True)
-
-        # 일치율 셀: 퍼센트 형식 (색상 없음)
-        rate_cell = ws.cell(row=row_idx, column=8, value=rate)
-        rate_cell.number_format = "0.0%"
-        rate_cell.fill = row_fill
-        rate_cell.border = _border()
-        rate_cell.alignment = _align("center")
+    # 주석 섹션
+    if results:
+        _write_section_header(ws, next_row, "■ 주석 (Notes)")
+        next_row += 1
+        _write_data_rows(ws, results, mappings, next_row)
 
     # 열 너비
-    col_widths = [8, 28, 35, 8, 8, 8, 8, 8, 10]
+    col_widths = [12, 28, 35, 8, 8, 8, 8, 8, 10]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -210,18 +264,23 @@ def _write_summary(wb: Workbook, results: list[ReconcileResult], mappings: list[
 
 # ─── Mapping_Log 시트 ────────────────────────────────────────────
 
-def _write_mapping_log(wb: Workbook, mappings: list[NoteMapping]):
+def _write_mapping_log(
+    wb: Workbook,
+    mappings: list[NoteMapping],
+    stmt_mappings: list[NoteMapping] | None = None,
+):
     ws = wb.create_sheet("Mapping_Log")
     ws.sheet_view.showGridLines = False
 
-    headers = ["국문 주석번호", "국문 주석 제목", "영문 Note번호", "영문 Note 제목", "매핑방법", "신뢰도"]
+    headers = ["번호/구분", "국문 제목", "영문 번호/구분", "영문 제목", "매핑방법", "신뢰도"]
     for col, h in enumerate(headers, 1):
         _write_cell(ws, 1, col, h,
                     fill=_fill(C_HEADER),
                     font=_font(bold=True, color="FFFFFF"),
                     align=_align("center"))
 
-    for row, m in enumerate(mappings, 2):
+    all_mappings = (stmt_mappings or []) + mappings
+    for row, m in enumerate(all_mappings, 2):
         en_num   = m.en_note.note_number if m.en_note else "—"
         en_title = m.en_note.note_title  if m.en_note else "영문 미존재"
         conf_fill = _fill(C_MATCH) if m.confidence >= 0.9 else (
@@ -237,7 +296,7 @@ def _write_mapping_log(wb: Workbook, mappings: list[NoteMapping]):
         conf_cell.border = _border()
         conf_cell.alignment = _align("center")
 
-    col_widths = [10, 30, 10, 35, 10, 8]
+    col_widths = [14, 30, 14, 35, 10, 8]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
@@ -307,11 +366,12 @@ def _write_mismatches(wb: Workbook, results: list[ReconcileResult]):
 
 # ─── Note_XX 시트 ────────────────────────────────────────────────
 
-def _write_note_sheet(wb: Workbook, result: ReconcileResult):
-    try:
-        sheet_name = f"Note_{int(result.note_number_kr):02d}"
-    except (ValueError, TypeError):
-        sheet_name = f"Note_{result.note_number_kr}"
+def _write_note_sheet(wb: Workbook, result: ReconcileResult, sheet_name: str | None = None):
+    if sheet_name is None:
+        try:
+            sheet_name = f"Note_{int(result.note_number_kr):02d}"
+        except (ValueError, TypeError):
+            sheet_name = f"Note_{result.note_number_kr}"
     # Excel 시트명 31자 제한 및 금지문자 처리
     sheet_name = sheet_name[:31].replace("/", "_").replace("\\", "_").replace("?", "X")
     ws = wb.create_sheet(sheet_name)

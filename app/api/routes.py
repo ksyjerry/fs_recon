@@ -9,10 +9,10 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from app.config import settings
-from app.services.dsd_service       import parse_dsd_file
-from app.services.en_doc_service    import parse_en_file
+from app.services.dsd_service       import parse_dsd_all, parse_dsd_file  # noqa: F401
+from app.services.en_doc_service    import parse_en_file, parse_en_financial_statements
 from app.services.excel_service     import generate_excel
-from app.services.mapping_service   import map_notes
+from app.services.mapping_service   import map_financial_statements, map_notes
 from app.services.reconcile_service import reconcile_all
 from app.utils.job_store import (
     append_log,
@@ -141,28 +141,32 @@ async def _run_reconciliation(
         append_log(job_id, "처리 파이프라인 시작")
         llm_client = get_llm_client(provider)
 
-        # Step 1+2: DSD 파싱 + 영문 문서 파싱 동시 실행 (두 작업은 서로 독립적)
+        # Step 1: DSD 전체 파싱(FS+주석) + 영문 문서 파싱 동시 실행
         progress(5, "DSD 파일 변환 + 영문 재무제표 파싱 중...")
-        (kr_notes, en_doc) = await asyncio.gather(
-            parse_dsd_file(dsd_path, llm_client),
+        (dsd_result, en_doc, en_statements) = await asyncio.gather(
+            parse_dsd_all(dsd_path, llm_client),
             parse_en_file(en_path),
+            parse_en_financial_statements(en_path),
         )
-        msg1 = f"DSD 파싱 완료: 주석 {len(kr_notes)}개 감지"
-        msg2 = f"영문 문서 파싱 완료: Note {len(en_doc.notes)}개 (포맷: {en_doc.format.value.upper()})"
+        kr_statements, kr_notes = dsd_result
+
+        msg1 = f"DSD 파싱 완료: 재무제표 {len(kr_statements)}종, 주석 {len(kr_notes)}개"
+        msg2 = f"영문 문서 파싱 완료: Note {len(en_doc.notes)}개, FS {len(en_statements)}종 (포맷: {en_doc.format.value.upper()})"
         logger.info("[%s] %s", job_id, msg1)
         logger.info("[%s] %s", job_id, msg2)
         append_log(job_id, msg1)
         append_log(job_id, msg2)
-        progress(15, "파싱 완료 — 주석 매핑 준비 중...")
+        progress(15, "파싱 완료 — 매핑 준비 중...")
 
-        # Step 3: 주석 매핑 (20%)
+        # Step 2: 주석 매핑 + FS 매핑 동시
         progress(20, "주석 매핑 중...")
         mappings = await map_notes(kr_notes, en_doc, llm_client)
-        msg3 = f"주석 매핑 완료: 국문↔영문 {len(mappings)}쌍"
+        stmt_mappings = map_financial_statements(kr_statements, en_statements)
+        msg3 = f"매핑 완료: 주석 {len(mappings)}쌍, 재무제표 {len(stmt_mappings)}쌍"
         logger.info("[%s] %s", job_id, msg3)
         append_log(job_id, msg3)
 
-        # Step 4: 대사 (20~90%, reconcile_all 내부에서 진행률 업데이트)
+        # Step 3: 대사 — FS + 주석 함께 (reconcile_all 재사용)
         def progress_with_log(pct: int, msg: str) -> None:
             update_job(job_id, progress=pct, step=msg)
 
@@ -170,21 +174,28 @@ async def _run_reconciliation(
             logger.warning("[%s] %s", job_id, msg)
             append_log(job_id, msg)
 
-        results = await reconcile_all(
-            mappings, llm_client,
+        # FS를 앞에 두어 진행률 계산에 포함
+        all_mappings = stmt_mappings + mappings
+        all_results = await reconcile_all(
+            all_mappings, llm_client,
             progress_cb=progress_with_log,
             warn_cb=warn_log,
         )
-        msg4 = f"LLM 대사 완료: {len(results)}개 주석 처리됨"
+        stmt_results = all_results[:len(stmt_mappings)]
+        results      = all_results[len(stmt_mappings):]
+
+        msg4 = f"LLM 대사 완료: 재무제표 {len(stmt_results)}종, 주석 {len(results)}개"
         logger.info("[%s] %s", job_id, msg4)
         append_log(job_id, msg4)
 
-        # Step 5: Excel 생성 (95%)
+        # Step 4: Excel 생성 (95%)
         progress(95, "Excel 파일 생성 중...")
         company_name = _extract_company_name(kr_notes)
         output_path = await generate_excel(
             results=results,
             mappings=mappings,
+            stmt_results=stmt_results,
+            stmt_mappings=stmt_mappings,
             company_name=company_name,
             output_dir=settings.outputs_dir,
         )

@@ -206,6 +206,31 @@ async def _llm_map(
     return llm_results
 
 
+def map_financial_statements(
+    kr_statements: list["DSDNote"],
+    en_statements: dict[str, "EnNote"],
+) -> list[NoteMapping]:
+    """
+    재무제표 본문 타입 기반 매핑 (LLM 불필요).
+    kr_statement.note_number = fs_type (예: "balance_sheet")이므로 직접 키 조회.
+    """
+    mappings: list[NoteMapping] = []
+    for kr_stmt in kr_statements:
+        fs_type = kr_stmt.note_number
+        en_note = en_statements.get(fs_type)
+        mappings.append(NoteMapping(
+            kr_note=kr_stmt,
+            en_note=en_note,
+            confidence=1.0 if en_note else 0.0,
+            method="type_match",
+        ))
+        if en_note:
+            logger.info("FS 매핑: %s [%s] ↔ [%s]", fs_type, kr_stmt.note_title, en_note.note_title)
+        else:
+            logger.warning("FS 매핑 실패: %s [%s] — 영문 미발견", fs_type, kr_stmt.note_title)
+    return mappings
+
+
 def _make_full_text_note(en_doc: EnDocument) -> EnNote:
     """Note 분리 실패 시 전체 텍스트를 담는 dummy EnNote 생성."""
     from app.models.en_doc_model import DocFormat

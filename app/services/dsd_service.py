@@ -50,6 +50,79 @@ _EXTRACT_SYSTEM = """\
 회계 테이블의 다차원 헤더(당기/전기, 레벨1/2/3, 만기구간 등)를 정확히 파악하세요.
 """
 
+# ── FS(재무제표 본문) 전용 추출 프롬프트 ──────────────────────────────
+_FS_EXTRACT_SYSTEM = """\
+당신은 한국 재무제표 본문(재무상태표·손익계산서·자본변동표·현금흐름표) 데이터 추출 전문가입니다.
+회계 테이블의 다차원 헤더(당기/전기, 유동/비유동 등)를 정확히 파악하세요.
+"""
+
+_FS_EXTRACT_USER = """\
+아래는 재무제표 {fs_title}의 전체 내용입니다.
+
+[DSD 특수 형식 안내 — 반드시 숙지]
+DSD 파일에서 테이블은 각 셀이 별도 줄로 나타납니다. 예시:
+  구분          ← 헤더 레이블
+  2025년        ← 헤더 컬럼1 (당기)
+  2024년        ← 헤더 컬럼2 (전기)
+  현금및현금성자산  ← 행 레이블
+  1,366,255     ← 행1 컬럼1 금액 (2025년)
+  707,200       ← 행1 컬럼2 금액 (2024년)
+  합계          ← 합계 행 레이블
+  6,274,247     ← 합계 컬럼1
+  925,199       ← 합계 컬럼2
+
+[추출 규칙]
+1. 모든 행(합계·소계·제목행 포함)을 추출하세요.
+2. 금액이 없는 순수 제목행은 is_header_only=true, amounts=[]
+3. 단위 감지: "(단위: 천원)" 등에서 unit 파악
+4. 금액을 원 단위로 정규화 (단위 "천원" → 값×1000, "백만원" → 값×1000000)
+5. 다차원 헤더를 attributes 딕셔너리로 표현
+   예) 당기/전기: {{"기간":"당기"}} / {{"기간":"전기"}}
+   컬럼 헤더가 연도(2025년/2024년)이면 {{"연도":"2025"}} 형식 사용
+6. "-" 또는 빈 셀은 value=null
+7. 괄호 금액은 음수: "(1,234,567)" → -1234567000 (천원 단위 가정)
+8. reasoning 없이 JSON만 반환 (마크다운·설명 금지)
+
+반환 형식:
+{{
+  "fs_type": "{fs_type}",
+  "fs_title": "{fs_title}",
+  "unit": "천원",
+  "items": [
+    {{
+      "item_id": 0,
+      "label": "행 레이블",
+      "is_header_only": false,
+      "amounts": [
+        {{
+          "attributes": {{"기간": "당기"}},
+          "value": 1234567000,
+          "raw_text": "1,234,567"
+        }}
+      ]
+    }}
+  ]
+}}
+
+재무제표 내용:
+{fs_content}
+"""
+
+# ── 한국어 재무제표 본문 타입 regex ────────────────────────────────────
+_KR_FS_PATTERNS: dict[str, re.Pattern] = {
+    "balance_sheet":    re.compile(r"재\s*무\s*상\s*태\s*표"),
+    "income_statement": re.compile(r"(?:포괄\s*)?손\s*익\s*계\s*산\s*서"),
+    "equity_changes":   re.compile(r"자\s*본\s*변\s*동\s*표"),
+    "cash_flow":        re.compile(r"현\s*금\s*흐\s*름\s*표"),
+}
+
+_FS_TYPE_TITLES: dict[str, str] = {
+    "balance_sheet":    "재무상태표",
+    "income_statement": "손익계산서",
+    "equity_changes":   "자본변동표",
+    "cash_flow":        "현금흐름표",
+}
+
 _EXTRACT_USER = """\
 아래는 재무제표 주석 {note_number}. {note_title}의 전체 내용입니다.
 
@@ -412,7 +485,74 @@ def _to_float(val) -> float | None:
         return None
 
 
-# ── 5. 메인 진입점 ────────────────────────────────────────────────────
+# ── 5. 재무제표 본문(FS) 경계 감지 + 추출 ───────────────────────────
+
+def _find_fs_boundaries(segments: list[dict], first_note_idx: int) -> list[dict]:
+    """
+    주석 시작 이전 세그먼트에서 재무제표 본문 4종의 제목 위치를 regex로 감지.
+    반환: [{"segment_index": int, "fs_type": str, "fs_title": str}, ...]
+    짧은 단락(≤ 30자)만 제목으로 간주 — 테이블 내 긴 셀 텍스트 제외.
+    """
+    search_until = first_note_idx if first_note_idx > 0 else len(segments)
+    results: list[dict] = []
+    found_types: set[str] = set()  # 중복 감지 방지
+
+    for i, seg in enumerate(segments[:search_until]):
+        if seg["type"] != "p":
+            continue
+        text = seg["text"].strip()
+        if len(text) > 30:
+            continue  # 긴 텍스트는 본문 셀 — 제목 아님
+        for fs_type, pat in _KR_FS_PATTERNS.items():
+            if fs_type not in found_types and pat.search(text):
+                results.append({
+                    "segment_index": i,
+                    "fs_type": fs_type,
+                    "fs_title": text,
+                })
+                found_types.add(fs_type)
+                break
+
+    logger.info("FS 경계 감지: %d종 %s", len(results),
+                [r["fs_type"] for r in results])
+    return results
+
+
+async def _llm_parse_fs(
+    fs_type: str,
+    fs_title: str,
+    fs_segments: list[dict],
+    llm_client,
+    sem: asyncio.Semaphore,
+) -> DSDNote | None:
+    """재무제표 본문 1종 → DSDNote (note_number = fs_type)."""
+    fs_content = _build_note_text(fs_segments)
+
+    messages = [
+        {"role": "system", "content": _FS_EXTRACT_SYSTEM},
+        {"role": "user",   "content": _FS_EXTRACT_USER.format(
+            fs_type=fs_type,
+            fs_title=fs_title,
+            fs_content=fs_content[:12000],
+        )},
+    ]
+
+    async with sem:
+        try:
+            result = await asyncio.to_thread(llm_client.chat_json, messages)
+        except Exception as e:
+            logger.error("FS %s 추출 실패: %s", fs_type, e)
+            return None
+
+    # FS 응답은 fs_type / fs_title 키 사용 → note_number/note_title 로 매핑
+    if isinstance(result, dict):
+        result.setdefault("note_number", fs_type)
+        result.setdefault("note_title",  result.get("fs_title", fs_title))
+
+    return _build_dsd_note(result, fallback_number=fs_type, fallback_title=fs_title)
+
+
+# ── 6. 메인 진입점 ────────────────────────────────────────────────────
 
 async def parse_dsd_file(dsd_path: Path, llm_client) -> list[DSDNote]:
     """
@@ -468,3 +608,79 @@ async def parse_dsd_file(dsd_path: Path, llm_client) -> list[DSDNote]:
     notes.sort(key=lambda n: int(n.note_number) if n.note_number.isdigit() else 999)
     logger.info("DSD 파싱 완료: 주석 %d개", len(notes))
     return notes
+
+
+async def parse_dsd_all(
+    dsd_path: Path,
+    llm_client,
+) -> tuple[list[DSDNote], list[DSDNote]]:
+    """
+    DSD 파일 → (재무제표 본문 4종, 주석 목록).
+
+    XML 파싱 1회만 수행 후 주석/FS를 병렬 추출.
+    반환: (statements, notes)
+      statements: note_number = fs_type ("balance_sheet" 등) 인 DSDNote 목록
+      notes:      기존 DSDNote 목록 (note_number = "1", "2" 등)
+    """
+    logger.info("DSD 전체 파싱 시작: %s", dsd_path.name)
+
+    # 1. 세그먼트 추출 (1회)
+    try:
+        segments = _extract_segments(dsd_path)
+    except Exception as e:
+        raise RuntimeError(f"DSD XML 추출 실패: {e}") from e
+    logger.info("  세그먼트: %d개", len(segments))
+
+    # 2. 주석 경계 감지 (LLM)
+    note_boundaries = await _llm_find_boundaries(segments, llm_client)
+    first_note_idx = note_boundaries[0]["segment_index"] if note_boundaries else len(segments)
+    logger.info("  주석 경계: %d개", len(note_boundaries))
+
+    # 3. FS 경계 감지 (regex, 주석 이전 구간)
+    fs_boundaries = _find_fs_boundaries(segments, first_note_idx)
+
+    # 4. 청크 계산
+    note_chunks: list[tuple[str, str, list[dict]]] = []
+    for i, b in enumerate(note_boundaries):
+        start = b["segment_index"]
+        end   = note_boundaries[i + 1]["segment_index"] if i + 1 < len(note_boundaries) else len(segments)
+        note_chunks.append((str(b.get("note_number", str(i+1))), str(b.get("note_title", "")), segments[start:end]))
+
+    # FS 청크: 각 FS 시작 ~ 다음 FS 시작(또는 첫 주석 이전)
+    fs_chunks: list[tuple[str, str, list[dict]]] = []
+    for i, b in enumerate(fs_boundaries):
+        start = b["segment_index"]
+        end   = fs_boundaries[i + 1]["segment_index"] if i + 1 < len(fs_boundaries) else first_note_idx
+        fs_chunks.append((b["fs_type"], b["fs_title"], segments[start:end]))
+
+    # 5. 병렬 추출 (주석 + FS 함께)
+    sem = asyncio.Semaphore(10)
+    note_tasks = [_llm_parse_note(num, title, segs, llm_client, sem) for num, title, segs in note_chunks]
+    fs_tasks   = [_llm_parse_fs(ft, ftt, segs, llm_client, sem)      for ft, ftt, segs in fs_chunks]
+
+    all_results = await asyncio.gather(*note_tasks, *fs_tasks, return_exceptions=True)
+
+    note_raw = all_results[:len(note_tasks)]
+    fs_raw   = all_results[len(note_tasks):]
+
+    notes: list[DSDNote] = []
+    for r in note_raw:
+        if isinstance(r, Exception):
+            logger.warning("주석 파싱 오류: %s", r)
+        elif r is not None:
+            notes.append(r)
+
+    statements: list[DSDNote] = []
+    for r in fs_raw:
+        if isinstance(r, Exception):
+            logger.warning("FS 파싱 오류: %s", r)
+        elif r is not None:
+            statements.append(r)
+
+    notes.sort(key=lambda n: int(n.note_number) if n.note_number.isdigit() else 999)
+    # FS는 _KR_FS_PATTERNS 키 순서로 정렬
+    _FS_ORDER = list(_KR_FS_PATTERNS.keys())
+    statements.sort(key=lambda s: _FS_ORDER.index(s.note_number) if s.note_number in _FS_ORDER else 99)
+
+    logger.info("DSD 전체 파싱 완료: 재무제표 %d종, 주석 %d개", len(statements), len(notes))
+    return statements, notes
