@@ -138,6 +138,13 @@ async def _parse_word(file_path: Path) -> EnDocument:
         )
         sections = _word_regex_sections(doc, body_elements, para_elements, table_elements)
 
+    # regex 기반도 3개 미만이면 bold 단락 감지 재시도
+    if len(sections) < 3:
+        logger.warning(
+            "Word regex 기반 Note %d개 — bold 단락 감지 재시도", len(sections)
+        )
+        sections = _word_bold_sections(body_elements, para_elements, table_elements)
+
     full_text = "\n\n".join(
         "\n".join(lines) for _, _, lines in sections
     )
@@ -239,6 +246,107 @@ def _word_regex_sections(
 
     flush()
     logger.info("Word regex 재파싱 완료: Note %d개", len(sections))
+    return sections
+
+
+_NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+# bold 단락 감지 시 제목으로 보기 어려운 패턴
+_BODY_TEXT_RE = re.compile(
+    r"^\s*\(|"                    # 괄호로 시작 (단위 표기 등)
+    r"thousand|million|won|krw|"  # 금액 단위 문구
+    r"^(?:the|this|these|it|in|as|for|of|an?)\s",  # 관사/전치사로 시작하는 문장
+    re.IGNORECASE,
+)
+
+
+def _get_para_ilvl(para) -> int:
+    """List Paragraph의 들여쓰기 레벨(ilvl) 반환. 없으면 -1."""
+    elem = para._element.find(f".//{{{_NS_W}}}ilvl")
+    if elem is not None:
+        try:
+            return int(elem.get(f"{{{_NS_W}}}val", -1))
+        except (TypeError, ValueError):
+            pass
+    return -1
+
+
+def _is_bold_title(para) -> bool:
+    """Bold 단락이고 제목처럼 짧은지 판단."""
+    text = para.text.strip()
+    if not text or len(text) > 70:
+        return False
+    if _BODY_TEXT_RE.match(text):
+        return False
+    # 첫 번째 non-empty run의 bold 여부
+    for run in para.runs:
+        if run.text.strip():
+            return run.bold is True
+    return False
+
+
+def _word_bold_sections(
+    body_elements: list,
+    para_elements: dict,
+    table_elements: dict,
+) -> list[tuple[str, str, list[str]]]:
+    """
+    3단계 fallback: bold 단락을 Note 제목으로 감지.
+    - List Paragraph ilvl=0: 최상위 자동번호 항목
+    - bold 바탕글/Normal 단락 (≤70자): 스타일 없는 bold 제목
+    위 두 종류를 Note 제목으로 사용하고 순번을 자동 부여.
+    """
+    sections: list[tuple[str, str, list[str]]] = []
+    current_num: str | None = None
+    current_title: str = ""
+    current_lines: list[str] = []
+    note_counter = 0
+
+    def flush():
+        nonlocal current_num, current_title, current_lines
+        if current_num is not None:
+            sections.append((current_num, current_title, list(current_lines)))
+        current_num = None
+        current_title = ""
+        current_lines = []
+
+    seen_titles: set[str] = set()
+
+    for elem in body_elements:
+        elem_id = id(elem)
+
+        if elem_id in para_elements:
+            para = para_elements[elem_id]
+            style = para.style.name if para.style else ""
+            text = para.text.strip()
+            if not text or _PAGE_NUM_RE.match(text):
+                continue
+
+            ilvl = _get_para_ilvl(para)
+            is_list_top = (style == "List Paragraph" and ilvl == 0)
+            is_bold_hdr = _is_bold_title(para) and style in ("바탕글", "Normal", "List Paragraph")
+
+            if (is_list_top or is_bold_hdr) and text not in seen_titles:
+                flush()
+                note_counter += 1
+                current_num = str(note_counter)
+                current_title = text
+                current_lines = [text]
+                seen_titles.add(text)
+            else:
+                if current_num is not None:
+                    current_lines.append(text)
+
+        elif elem_id in table_elements:
+            if current_num is None:
+                continue
+            table = table_elements[elem_id]
+            table_text = _table_to_text(table)
+            if table_text:
+                current_lines.append(table_text)
+
+    flush()
+    logger.info("Word bold 단락 감지 완료: Note %d개", len(sections))
     return sections
 
 
