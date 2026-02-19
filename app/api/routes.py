@@ -141,19 +141,19 @@ async def _run_reconciliation(
         append_log(job_id, "처리 파이프라인 시작")
         llm_client = get_llm_client(provider)
 
-        # Step 1: DSD 파싱 (5%)
-        progress(5, "DSD 파일 변환 중...")
-        kr_notes = await parse_dsd_file(dsd_path, llm_client)
+        # Step 1+2: DSD 파싱 + 영문 문서 파싱 동시 실행 (두 작업은 서로 독립적)
+        progress(5, "DSD 파일 변환 + 영문 재무제표 파싱 중...")
+        (kr_notes, en_doc) = await asyncio.gather(
+            parse_dsd_file(dsd_path, llm_client),
+            parse_en_file(en_path),
+        )
         msg1 = f"DSD 파싱 완료: 주석 {len(kr_notes)}개 감지"
-        logger.info("[%s] %s", job_id, msg1)
-        append_log(job_id, msg1)
-
-        # Step 2: 영문 문서 파싱 (15%)
-        progress(15, "영문 재무제표 파싱 중...")
-        en_doc = await parse_en_file(en_path)
         msg2 = f"영문 문서 파싱 완료: Note {len(en_doc.notes)}개 (포맷: {en_doc.format.value.upper()})"
+        logger.info("[%s] %s", job_id, msg1)
         logger.info("[%s] %s", job_id, msg2)
+        append_log(job_id, msg1)
         append_log(job_id, msg2)
+        progress(15, "파싱 완료 — 주석 매핑 준비 중...")
 
         # Step 3: 주석 매핑 (20%)
         progress(20, "주석 매핑 중...")

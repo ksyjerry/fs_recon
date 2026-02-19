@@ -131,6 +131,13 @@ async def _parse_word(file_path: Path) -> EnDocument:
 
     flush()
 
+    # 스타일 기반 Note가 3개 미만이면 regex 기반 재시도
+    if len(sections) < 3:
+        logger.warning(
+            "Word 스타일 기반 Note %d개 — regex 기반 재시도", len(sections)
+        )
+        sections = _word_regex_sections(doc, body_elements, para_elements, table_elements)
+
     full_text = "\n\n".join(
         "\n".join(lines) for _, _, lines in sections
     )
@@ -163,6 +170,76 @@ def _word_full_text(doc) -> str:
         if text and not _PAGE_NUM_RE.match(text):
             parts.append(text)
     return "\n".join(parts)
+
+
+# 영문 Word Note 제목 regex — "NOTE 1", "NOTE 1.", "1. General Information" 등
+_WORD_NOTE_RE = re.compile(
+    r"^\s*(?:NOTE\s+)?(\d+)\s*[.\:\-—]?\s*([A-Z][^\n]{0,120})\s*$",
+    re.IGNORECASE,
+)
+
+
+def _word_regex_sections(
+    doc,
+    body_elements: list,
+    para_elements: dict,
+    table_elements: dict,
+) -> list[tuple[str, str, list[str]]]:
+    """
+    스타일 기반 Note 감지 실패 시 regex 기반 재시도.
+    "NOTE 1.", "1. General Information" 등 패턴으로 Note 제목 감지.
+    """
+    sections: list[tuple[str, str, list[str]]] = []
+    current_num: str | None = None
+    current_title: str = ""
+    current_lines: list[str] = []
+
+    def flush():
+        nonlocal current_num, current_title, current_lines
+        if current_num is not None:
+            sections.append((current_num, current_title, list(current_lines)))
+        current_num = None
+        current_title = ""
+        current_lines = []
+
+    seen_note_nums: set[str] = set()
+
+    for elem in body_elements:
+        elem_id = id(elem)
+
+        if elem_id in para_elements:
+            para = para_elements[elem_id]
+            text = para.text.strip()
+            if not text or _PAGE_NUM_RE.match(text):
+                continue
+
+            m = _WORD_NOTE_RE.match(text)
+            if m:
+                num = m.group(1)
+                title = m.group(2).strip()
+                # 이미 등장한 번호면 본문으로 간주 (하위 섹션 헤더 등 중복 방지)
+                if num not in seen_note_nums:
+                    flush()
+                    current_num = num
+                    current_title = title
+                    current_lines = [text]
+                    seen_note_nums.add(num)
+                    continue
+
+            if current_num is not None:
+                current_lines.append(text)
+
+        elif elem_id in table_elements:
+            if current_num is None:
+                continue
+            table = table_elements[elem_id]
+            table_text = _table_to_text(table)
+            if table_text:
+                current_lines.append(table_text)
+
+    flush()
+    logger.info("Word regex 재파싱 완료: Note %d개", len(sections))
+    return sections
 
 
 def _table_to_text(table) -> str:

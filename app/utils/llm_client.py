@@ -36,12 +36,15 @@ class BaseLLMClient(ABC):
     def chat_json(self, messages: list[dict]) -> dict | list:
         """
         JSON 응답 보장 버전.
-        response_format={"type": "json_object"} 로 JSON mode 활성화.
         마크다운 코드블록 자동 제거 후 파싱 (안전망).
         응답이 절단된 경우 완전한 객체만 부분 복구.
         파싱 실패 시 ValueError 발생.
+
+        Note: response_format=json_object 는 Bedrock/PwC 엔드포인트에서
+        배열을 객체로 감싸서 반환하는 부작용이 있어 사용하지 않음.
+        대신 강화된 system prompt로 JSON 준수 유도.
         """
-        raw = self.chat(messages, temperature=0.0, response_format={"type": "json_object"})
+        raw = self.chat(messages, temperature=0.0)
         cleaned = raw.strip()
 
         # ```json ... ``` 또는 ``` ... ``` 블록 제거

@@ -285,6 +285,13 @@ def _regex_find_boundaries(segments: list[dict]) -> list[dict]:
     PAT_EXPLICIT = re.compile(r"^\s*주\s*석\s*(\d+)\s*[.\s]*(.*)\s*$")
     PAT_SIMPLE   = re.compile(r"^\s*(\d+)\s*[.\s]\s*([가-힣\w\s]{2,40})\s*$")
 
+    # 감사보고서 섹션 키워드 — 이 단어를 포함하는 제목은 재무주석이 아님
+    _AUDITOR_KEYWORDS = re.compile(
+        r"감사대상|감사참여|감사실시|감사의견|핵심감사|감사범위|감사기준|"
+        r"경영진의\s*책임|감사인의\s*책임|감사보고|내부통제|계속기업",
+        re.IGNORECASE,
+    )
+
     results: list[dict] = []
     for i, seg in enumerate(segments):
         if seg["type"] != "p":
@@ -293,10 +300,15 @@ def _regex_find_boundaries(segments: list[dict]) -> list[dict]:
         for pat in [PAT_EXPLICIT, PAT_SIMPLE]:
             m = pat.match(text)
             if m:
+                title = m.group(2).strip()
+                # 감사보고서 섹션 제목은 재무주석이 아니므로 제외
+                if _AUDITOR_KEYWORDS.search(title):
+                    logger.debug("감사보고서 섹션 제외: %r", text)
+                    break
                 results.append({
                     "segment_index": i,
                     "note_number": m.group(1).strip(),
-                    "note_title": m.group(2).strip(),
+                    "note_title": title,
                 })
                 break
     logger.info("Regex 주석 경계 감지: %d개", len(results))
@@ -409,7 +421,7 @@ async def parse_dsd_file(dsd_path: Path, llm_client) -> list[DSDNote]:
     1. DSD ZIP에서 contents.xml 직접 추출
     2. XML → 텍스트 세그먼트 변환
     3. LLM이 주석 경계(번호·제목) 감지
-    4. LLM이 각 주석 금액 구조화 추출 (병렬, Semaphore 3)
+    4. LLM이 각 주석 금액 구조화 추출 (병렬, Semaphore 10)
     """
     logger.info("DSD 파싱 시작 (LLM 모드): %s", dsd_path.name)
 
@@ -439,7 +451,7 @@ async def parse_dsd_file(dsd_path: Path, llm_client) -> list[DSDNote]:
         ))
 
     # 4. 병렬 금액 추출
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(10)
     tasks = [
         _llm_parse_note(num, title, segs, llm_client, sem)
         for num, title, segs in chunks
