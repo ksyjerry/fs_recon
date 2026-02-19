@@ -324,7 +324,9 @@ def _word_bold_sections(
 
             ilvl = _get_para_ilvl(para)
             is_list_top = (style == "List Paragraph" and ilvl == 0)
-            is_bold_hdr = _is_bold_title(para) and style in ("바탕글", "Normal", "List Paragraph")
+            # List Paragraph는 ilvl=0만 is_list_top으로 처리
+            # ilvl=1 이상(회계정책 하위섹션 등)은 bold여도 Note 제목으로 보지 않음
+            is_bold_hdr = _is_bold_title(para) and style in ("바탕글", "Normal")
 
             if (is_list_top or is_bold_hdr) and text not in seen_titles:
                 flush()
