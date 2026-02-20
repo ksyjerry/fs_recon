@@ -42,11 +42,16 @@ _EN_FS_TITLES: dict[str, str] = {
 }
 
 # 페이지 헤더/푸터 노이즈 패턴 (PDF 특화)
+# Notes 페이지마다 반복되는 "Notes to Financial Statements" 헤더 제거
 _PDF_HEADER_RE = re.compile(
-    r"(GOWOONSESANG.{0,80}Notes to.{0,80}December 31)",
+    r"notes\s+to\s+(?:the\s+)?financial\s+statements",
     re.IGNORECASE,
 )
 _PAGE_NUM_RE = re.compile(r"^\d{1,3}$")
+
+# 재무 금액 패턴: 7자리 이상 콤마 구분 숫자 (예: 17,776,669,377)
+# FS 실제 페이지 vs 목차 페이지 구분용
+_FINANCIAL_AMOUNT_RE = re.compile(r'\b\d{1,3}(?:,\d{3}){2,}\b')
 
 # Word 파서에서 Note 제목으로 인식할 스타일 이름들
 _WORD_TITLE_STYLES = {"ABCTitle", "Heading 1", "heading 1", "Title"}
@@ -666,7 +671,10 @@ async def parse_en_financial_statements(file_path: Path) -> dict[str, "EnNote"]:
 
 
 async def _parse_en_fs_word(file_path: Path) -> dict[str, "EnNote"]:
-    """Word 파일에서 영문 재무제표 본문 섹션 추출."""
+    """
+    Word 파일에서 영문 재무제표 본문 섹션 추출.
+    Notes 섹션 제목 감지 시 즉시 수집 종료.
+    """
     import docx
 
     doc = docx.Document(str(file_path))
@@ -674,38 +682,39 @@ async def _parse_en_fs_word(file_path: Path) -> dict[str, "EnNote"]:
     para_elements = {id(p._element): p for p in doc.paragraphs}
     table_elements = {id(t._element): t for t in doc.tables}
 
-    # fs_type → 수집 중인 라인 목록
     current_fs: str | None = None
-    current_title: str = ""
-    accumulated: dict[str, list[str]] = {}  # fs_type → lines
+    accumulated: dict[str, list[str]] = {}
     accumulated_titles: dict[str, str] = {}
-
-    def flush_fs():
-        nonlocal current_fs, current_title
-        if current_fs is not None and current_fs not in accumulated:
-            accumulated[current_fs] = []
-            accumulated_titles[current_fs] = current_title
-        current_fs = None
 
     for elem in body_elements:
         elem_id = id(elem)
 
         if elem_id in para_elements:
             para = para_elements[elem_id]
+            style_name = para.style.name if para.style else ""
             text = para.text.strip()
             if not text or _PAGE_NUM_RE.match(text):
                 continue
+
+            # Notes 섹션 시작 감지 → 즉시 수집 종료
+            # (Heading/ABCTitle 스타일 + Note 번호 패턴)
+            is_heading = style_name in _WORD_TITLE_STYLES
+            if is_heading and _WORD_NOTE_RE.match(text):
+                logger.info(
+                    "Word FS 파싱: Notes 섹션 시작(%r) → FS 수집 종료 (%d종)",
+                    text[:50], len(accumulated),
+                )
+                break
 
             # FS 타입 제목 감지
             detected = False
             for fs_type, pat in _EN_FS_PATTERNS.items():
                 if fs_type not in accumulated and pat.search(text) and len(text) < 120:
-                    flush_fs()
                     current_fs = fs_type
-                    current_title = text
                     accumulated[fs_type] = [text]
                     accumulated_titles[fs_type] = text
                     detected = True
+                    logger.info("Word FS: %s 감지 (제목=%r)", fs_type, text[:60])
                     break
 
             if not detected and current_fs is not None:
@@ -719,54 +728,108 @@ async def _parse_en_fs_word(file_path: Path) -> dict[str, "EnNote"]:
             if table_text:
                 accumulated[current_fs].append(table_text)
 
-    result: dict[str, EnNote] = {}
-    for fs_type, lines in accumulated.items():
-        raw_text = "\n".join(lines)
-        result[fs_type] = EnNote(
-            note_number=fs_type,
-            note_title=accumulated_titles.get(fs_type, _EN_FS_TITLES.get(fs_type, fs_type)),
-            raw_text=raw_text,
-            source_format=DocFormat.WORD,
-        )
-
-    logger.info("영문 FS 파싱 완료 (Word): %d종 %s", len(result), list(result.keys()))
-    return result
+    return _build_fs_result(accumulated, accumulated_titles, DocFormat.WORD)
 
 
 async def _parse_en_fs_pdf(file_path: Path) -> dict[str, "EnNote"]:
-    """PDF 파일에서 영문 재무제표 본문 섹션 추출."""
+    """
+    PDF 파일에서 영문 재무제표 본문 섹션 추출 (페이지 단위 감지).
+
+    핵심 전략:
+    1. 각 페이지의 첫 N줄에서 FS 제목 패턴 탐색
+    2. FS 제목 감지 + 재무 금액 존재 → 실제 FS 페이지 (목차와 구분)
+    3. FS 제목만 있고 금액 없는 페이지 → 목차/표지 추정, 건너뜀
+    4. Notes 제목 패턴 감지 페이지 → 수집 즉시 종료
+
+    이 방식으로:
+    - 목차(TOC) 페이지의 FS 제목 오감지 방지
+    - 마지막 FS 이후 Notes 29페이지가 FS에 흡수되는 문제 해결
+    - 여러 페이지에 걸친 FS도 올바르게 연속 수집
+    """
     import pdfplumber
 
-    all_lines: list[str] = []
-
-    with pdfplumber.open(str(file_path)) as pdf:
-        for page in pdf.pages:
-            raw = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-            cleaned = _clean_pdf_page(raw)
-            if cleaned.strip():
-                all_lines.extend(cleaned.split("\n"))
-
-    current_fs: str | None = None
     accumulated: dict[str, list[str]] = {}
     accumulated_titles: dict[str, str] = {}
+    current_fs: str | None = None
 
-    for line in all_lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
+    _SCAN_LINES = 6  # 페이지 첫 N줄에서 FS/Notes 제목 탐색
 
-        detected = False
-        for fs_type, pat in _EN_FS_PATTERNS.items():
-            if fs_type not in accumulated and pat.search(stripped) and len(stripped) < 120:
-                current_fs = fs_type
-                accumulated[fs_type] = [stripped]
-                accumulated_titles[fs_type] = stripped
-                detected = True
+    with pdfplumber.open(str(file_path)) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            raw = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+            if not raw.strip():
+                continue
+
+            cleaned = _clean_pdf_page(raw)
+            lines = [l.strip() for l in cleaned.split("\n") if l.strip()]
+            if not lines:
+                continue
+
+            page_text = "\n".join(lines)
+
+            # ── 1) Notes 섹션 시작 감지 → 즉시 종료 ──────────────
+            notes_started = False
+            for line in lines[:_SCAN_LINES]:
+                if _NOTE_RE.match(line) and not re.match(r"^\d+\.\d+", line):
+                    notes_started = True
+                    break
+
+            if notes_started:
+                logger.info(
+                    "PDF FS 파싱: Notes 섹션 시작(p.%d) → FS 수집 종료 (%d종)",
+                    page_num, len(accumulated),
+                )
                 break
 
-        if not detected and current_fs is not None:
-            accumulated[current_fs].append(stripped)
+            # ── 2) FS 제목 감지 (첫 N줄) ─────────────────────────
+            new_fs: str | None = None
+            new_fs_title: str = ""
+            for line in lines[:_SCAN_LINES]:
+                for fs_type, pat in _EN_FS_PATTERNS.items():
+                    if pat.search(line) and len(line) < 120:
+                        new_fs = fs_type
+                        new_fs_title = line
+                        break
+                if new_fs:
+                    break
 
+            has_amounts = bool(_FINANCIAL_AMOUNT_RE.search(page_text))
+
+            if new_fs:
+                if new_fs not in accumulated:
+                    if has_amounts:
+                        # 재무 금액 있음 → 실제 FS 페이지
+                        current_fs = new_fs
+                        accumulated[new_fs] = lines
+                        accumulated_titles[new_fs] = new_fs_title
+                        logger.info(
+                            "PDF FS: %s 감지 (p.%d, 제목=%r)",
+                            new_fs, page_num, new_fs_title,
+                        )
+                    else:
+                        # 금액 없음 → 목차/표지 추정, 건너뜀
+                        logger.debug(
+                            "PDF FS: %s 제목 감지(p.%d), 금액 없음 → 목차 추정, 건너뜀",
+                            new_fs, page_num,
+                        )
+                else:
+                    # 이미 수집된 FS 타입 재감지 → 건너뜀
+                    logger.debug("PDF FS: %s 재감지(p.%d) → 건너뜀", new_fs, page_num)
+
+            elif current_fs is not None:
+                # FS/Notes 패턴 없음 → 현재 FS의 연속 페이지
+                accumulated[current_fs].extend(lines)
+                logger.debug("PDF FS: %s 연속 p.%d", current_fs, page_num)
+
+    return _build_fs_result(accumulated, accumulated_titles, DocFormat.PDF)
+
+
+def _build_fs_result(
+    accumulated: dict[str, list[str]],
+    accumulated_titles: dict[str, str],
+    fmt: DocFormat,
+) -> dict[str, "EnNote"]:
+    """FS 수집 결과를 EnNote 딕셔너리로 변환."""
     result: dict[str, EnNote] = {}
     for fs_type, lines in accumulated.items():
         raw_text = "\n".join(lines)
@@ -774,8 +837,10 @@ async def _parse_en_fs_pdf(file_path: Path) -> dict[str, "EnNote"]:
             note_number=fs_type,
             note_title=accumulated_titles.get(fs_type, _EN_FS_TITLES.get(fs_type, fs_type)),
             raw_text=raw_text,
-            source_format=DocFormat.PDF,
+            source_format=fmt,
         )
-
-    logger.info("영문 FS 파싱 완료 (PDF): %d종 %s", len(result), list(result.keys()))
+    logger.info(
+        "영문 FS 파싱 완료 (%s): %d종 %s",
+        fmt.value, len(result), list(result.keys()),
+    )
     return result
