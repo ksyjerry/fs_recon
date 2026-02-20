@@ -64,7 +64,7 @@ export default function Home() {
         <div className="flex gap-4">
           <FileUploadZone
             label="국문 DSD 파일"
-            subLabel="DSD 양식 → JSON 변환"
+            subLabel="국문 DSD 파일을 업로드하세요"
             accept=".dsd"
             acceptDesc=".dsd 파일"
             file={dsdFile}
@@ -73,7 +73,7 @@ export default function Home() {
           />
           <FileUploadZone
             label="영문 재무제표"
-            subLabel="Word 또는 PDF"
+            subLabel="영문 Word 또는 PDF 파일을 업로드하세요"
             accept=".docx,.pdf"
             acceptDesc=".docx 또는 .pdf"
             file={enFile}
