@@ -20,11 +20,15 @@ export default function Header() {
           <span className="text-pwc-grey-70 text-sm font-medium">
             SARA
           </span>
+          <span className="w-px h-5 bg-pwc-grey-20" />
+          <span className="text-pwc-grey-70 text-sm font-semibold">
+            국영문 보고서 대사
+          </span>
         </div>
 
-        {/* 페이지 제목 */}
-        <div className="text-pwc-grey-70 text-sm font-semibold">
-          국영문 보고서 대사
+        {/* 개발팀 표시 */}
+        <div className="text-pwc-grey-70 text-sm italic">
+          Developed by Assurance DA
         </div>
       </div>
     </header>
